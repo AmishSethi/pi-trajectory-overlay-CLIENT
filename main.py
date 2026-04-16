@@ -228,6 +228,34 @@ class PlanningState:
         return self.step_idx >= len(self.steps)
 
 
+def _enrich_step_context(planning: PlanningState) -> tuple[str, str, str]:
+    """Pull target info from later steps when current step has empty target_location.
+
+    For multi-step tasks like "Remove X from Y and put it on Z", step 0 has
+    target_location="" but step 1 has target_location="on Z" and
+    target_related_object="Z". We merge this context so the trajectory
+    generator knows WHERE the object should ultimately go.
+
+    Returns (target_location, target_related_object, extra_detect_query).
+    """
+    step_data = planning.current_step
+    target_location = step_data["target_location"]
+    target_related = step_data["target_related_object"]
+    extra_query = ""
+
+    if not target_location and planning.step_idx + 1 < len(planning.steps):
+        next_step = planning.steps[planning.step_idx + 1]
+        if next_step.get("target_location"):
+            target_location = next_step["target_location"]
+            print(f"[context] Enriched target_location from step {planning.step_idx + 1}: \"{target_location}\"")
+        if next_step.get("target_related_object") and not target_related:
+            target_related = next_step["target_related_object"]
+            extra_query = target_related
+            print(f"[context] Enriched target_related from step {planning.step_idx + 1}: \"{target_related}\"")
+
+    return target_location, target_related, extra_query
+
+
 def _predict_trajectory(
     planning: PlanningState,
     ext_image_rgb: np.ndarray,
@@ -236,6 +264,11 @@ def _predict_trajectory(
 ) -> dict | None:
     """Run object detection + trajectory generation for the current step.
 
+    Handles three key issues:
+    1. Missing object detections — retries individually via query_target_location
+    2. Empty target_location — enriches from subsequent steps in multi-step tasks
+    3. Fuzzy object name matching — tolerates Gemini labeling differences
+
     Returns trajectory dict with points in original image coordinates, or None.
     """
     step_data = planning.current_step
@@ -243,9 +276,17 @@ def _predict_trajectory(
         return None
 
     manipulating_object = step_data["manipulating_object"]
-    target_related_object = step_data["target_related_object"]
-    target_location = step_data["target_location"]
-    target_objects = list(set([manipulating_object, target_related_object]))
+
+    # Enrich context from later steps if current step has empty target
+    target_location, target_related_object, extra_query = _enrich_step_context(planning)
+
+    # Build query list — include extra objects from context enrichment
+    detect_queries = [manipulating_object]
+    if target_related_object:
+        detect_queries.append(target_related_object)
+    if extra_query and extra_query not in detect_queries:
+        detect_queries.append(extra_query)
+    detect_queries = list(set(q for q in detect_queries if q.strip()))
 
     # Resize for API
     pil_img = Image.fromarray(ext_image_rgb).convert("RGB")
@@ -253,23 +294,35 @@ def _predict_trajectory(
     api_img = resize_for_api(pil_img, max_size=1024)
     api_size = api_img.size
 
-    # Detect objects
-    object_locations = query_target_location(api_img, target_objects, model_name=args.gemini_model)
+    # Detect objects (with automatic retry for missing ones)
+    object_locations = query_target_location(api_img, detect_queries, model_name=args.gemini_model)
     if object_locations is None:
-        print("[trajectory] Object detection failed")
+        print("[trajectory] Object detection failed completely")
         return None
 
     manip_pt = object_locations.get(manipulating_object)
-    target_pt = object_locations.get(target_related_object)
+    target_pt = object_locations.get(target_related_object) if target_related_object else None
 
-    if manip_pt is None or target_pt is None:
-        missing = []
-        if manip_pt is None:
-            missing.append(manipulating_object)
-        if target_pt is None:
-            missing.append(target_related_object)
-        print(f"[trajectory] Object(s) not found: {missing}. Detected: {list(object_locations.keys())}")
+    # If manipulating object not found, use first available detection
+    if manip_pt is None and object_locations:
+        manip_pt = next(iter(object_locations.values()))
+        print(f"[trajectory] Using fallback detection for '{manipulating_object}'")
+
+    if manip_pt is None:
+        print(f"[trajectory] Cannot find manipulating object '{manipulating_object}'")
         return None
+
+    # If target object not found, use last available detection (if different from manip)
+    if target_pt is None and target_related_object:
+        remaining = {k: v for k, v in object_locations.items()
+                     if v != manip_pt}
+        if remaining:
+            target_pt = next(iter(remaining.values()))
+            print(f"[trajectory] Using fallback detection for '{target_related_object}'")
+
+    # If still no target, set it to None — GPT will handle it via target_location text
+    if target_pt is None:
+        target_pt = manip_pt  # GPT will use target_location string to determine direction
 
     # Generate trajectory
     img_encoded = encode_pil_image(api_img)
@@ -279,7 +332,7 @@ def _predict_trajectory(
         task=step_data["step"],
         manipulating_object=manipulating_object,
         manipulating_object_point=manip_pt,
-        target_related_object=target_related_object,
+        target_related_object=target_related_object or "target area",
         target_related_object_point=target_pt,
         target_location=target_location,
         gpt_model=args.gpt_model,

@@ -216,11 +216,18 @@ INPUT:
 GOAL: Predict the 2D path that the manipulated object will follow on the tabletop as the robot executes this step. This trajectory will be drawn on the camera image to guide the robot.
 
 IMPORTANT — TRAJECTORY SCALE:
-- The trajectory must show MEANINGFUL displacement. A robot manipulation typically moves objects 15-30% of the image width.
-- If the task says "remove from X" or "pick up from X", the object must move AWAY from X by a substantial distance (at least 15% of image width).
-- If the task says "put on Y" or "place in Y", the object must move TOWARD Y's location.
-- If the target location is vague (e.g., "on the table"), choose a clear, open area of the table that is far from the starting position.
-- NEVER generate a trajectory where the end point is within 10% of image width from the start point unless the task explicitly requires a small motion.
+- ALL trajectories must show MEANINGFUL displacement: at least 10-30% of image width.
+- "remove from X" / "pick up from X" / "take from X": object moves AWAY from X toward a clear area.
+- "put in/on Y" / "place in Y": object moves FROM current position TOWARD Y's location.
+- "move X to the left/right/forward": object moves in that direction by 15-25% of image width.
+- "open" a door/drawer/lid: the object swings or slides AWAY from its closed position (10-20% displacement).
+- "close" a door/drawer/lid: the object moves BACK toward its closed position (10-20% displacement).
+- "pick up" with no target: lift upward (toward top of image) by 15-20% of image height.
+- "wipe"/"sweep": object moves across a surface toward the target area.
+- "pour": object moves toward and tilts over the target container.
+- "press"/"push button"/"flip switch": the ONLY tasks where small displacement is acceptable (5-10% approach from above).
+- If the target location is vague ("on the table"), choose a clear open area FAR from the start (at least 15% of image width away).
+- NEVER generate a trajectory shorter than 10% of image width unless it is specifically a button-press or switch-flip task.
 
 REQUIREMENTS:
 1. The movement should be relative to the robot's perspective, not the camera.
@@ -447,22 +454,40 @@ def query_target_objects(
     return json.loads(response.choices[0].message.content)
 
 
-def query_target_location(
+def _fuzzy_find(locs: dict[str, tuple], query: str) -> tuple[float, float] | None:
+    """Fuzzy-match a query against detected object labels."""
+    q = query.lower().strip()
+    if not q:
+        return None
+    # Exact match
+    if query in locs:
+        return locs[query]
+    # Substring match
+    for k, v in locs.items():
+        kl = k.lower()
+        if q in kl or kl in q:
+            return v
+    # Word overlap
+    q_words = set(q.split())
+    for k, v in locs.items():
+        k_words = set(k.lower().split())
+        if q_words & k_words:
+            return v
+    return None
+
+
+def _run_gemini_point_detection(
     img: Image.Image,
     queries: list[str],
-    model_name: str = "gemini-robotics-er-1.5-preview",
-) -> dict[str, tuple[float, float]] | None:
-    """Detect object locations in image using Gemini Robotics-ER.
-
-    Returns dict mapping object names to (x, y) pixel coordinates, or None on failure.
-    """
+    model_name: str,
+) -> dict[str, tuple[float, float]]:
+    """Single Gemini point-detection call. Returns {label: (x, y)} in pixel coords."""
     point_prompt = textwrap.dedent(f"""\
-    Get all points matching the following objects: {', '.join(queries)}. The label
-    returned should be an identifying name for the object detected.
+    Locate these specific objects in the image: {', '.join(queries)}.
+    Return exactly ONE point per object. Do NOT return duplicates or
+    other objects not in the list. Limit your response to at most {len(queries)} entries.
 
-    Note that there shall be multiple table corners in the image.
-
-    The answer should follow the JSON format:
+    Return a JSON array:
     [{{"point": [y_norm, x_norm], "label": "object-name"}}, ...]
 
     The points are in [y, x] format normalized to 0-1000.
@@ -474,18 +499,66 @@ def query_target_location(
     try:
         data = json.loads(json_output)
     except json.JSONDecodeError:
-        print("Warning: Invalid JSON from Gemini. Skipping.")
-        return None
+        return {}
 
-    object_locations = {}
-    for item in data:
+    locs = {}
+    for item in data[:10]:  # cap at 10 to prevent runaway responses
+        if "label" not in item or "point" not in item:
+            continue
         name = item["label"]
         y_norm, x_norm = item["point"]
         x = (x_norm / 1000.0) * width
         y = (y_norm / 1000.0) * height
-        object_locations[name] = (x, y)
+        locs[name] = (x, y)
+    return locs
 
-    return object_locations
+
+def query_target_location(
+    img: Image.Image,
+    queries: list[str],
+    model_name: str = "gemini-robotics-er-1.5-preview",
+) -> dict[str, tuple[float, float]] | None:
+    """Detect object locations in image using Gemini Robotics-ER.
+
+    If not all requested objects are found in the first call, retries
+    with individual queries for any missing objects.
+
+    Returns dict mapping object names to (x, y) pixel coordinates, or None on failure.
+    """
+    # Remove empty queries
+    queries = [q for q in queries if q.strip()]
+    if not queries:
+        return None
+
+    # First attempt: all queries together
+    locs = _run_gemini_point_detection(img, queries, model_name)
+    if not locs:
+        return None
+
+    # Check which queries were found (with fuzzy matching)
+    resolved = {}
+    missing = []
+    for q in queries:
+        pt = _fuzzy_find(locs, q)
+        if pt is not None:
+            resolved[q] = pt
+        else:
+            missing.append(q)
+
+    # Retry individually for any missing objects
+    for q in missing:
+        print(f"[Gemini retry] '{q}' not found, retrying individually...")
+        retry_locs = _run_gemini_point_detection(img, [q], model_name)
+        if retry_locs:
+            pt = _fuzzy_find(retry_locs, q)
+            if pt is not None:
+                resolved[q] = pt
+            else:
+                # Take the first detection even if label doesn't match
+                resolved[q] = next(iter(retry_locs.values()))
+                print(f"[Gemini retry] Using closest detection: {list(retry_locs.keys())[0]}")
+
+    return resolved if resolved else None
 
 
 def query_trajectory(
