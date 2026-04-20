@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 example_outputs/
 *.egg-info/
+
+# Per-rollout output directories (videos, frames, planning reports, actions.log)
+runs/
+runs_pi05/

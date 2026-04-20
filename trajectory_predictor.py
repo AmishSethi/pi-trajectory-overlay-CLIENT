@@ -20,8 +20,38 @@ import base64
 import io
 import json
 import os
+import socket as _socket
 import textwrap
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# IPv4-only DNS patch
+# ---------------------------------------------------------------------------
+# Some lab networks (e.g., UPenn SEAS) silently drop IPv6 replies. Python HTTP
+# clients (httpx / requests / google-genai gRPC) pick an IPv6 endpoint first
+# via Happy Eyeballs and then block in SYN_SENT for ~60-90s before failing over
+# to IPv4. This makes every Gemini/OpenAI call hang.
+#
+# The fix: filter IPv6 results out of getaddrinfo so Python only ever sees A
+# records. Applied once at module import so every downstream library (openai,
+# google-genai, httpx) sees IPv4-only hostnames.
+_original_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    # Force AF_INET; strip AF_INET6 results if any slip through.
+    results = _original_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+    return [r for r in results if r[0] == _socket.AF_INET]
+
+
+if os.environ.get("ALLOW_IPV6") != "1":
+    _socket.getaddrinfo = _ipv4_only_getaddrinfo
+
+
+# ---------------------------------------------------------------------------
+# Third-party imports (after the patch so they inherit the IPv4-only resolver)
+# ---------------------------------------------------------------------------
 
 import numpy as np
 from google import genai

@@ -1,172 +1,115 @@
-# DROID Trajectory Overlay Inference
+# pi-trajectory-overlay
 
-Standalone inference pipeline for the `brandonyang/pi05_droid_trajectory_overlay` checkpoint — a pi0.5 model fine-tuned to follow trajectories drawn on the exterior camera image.
+Standalone DROID inference client for pi0.5 checkpoints — with optional
+Gemini/GPT trajectory-overlay guidance.
 
 ## Architecture
 
-This repo runs the **robot laptop side** of the inference loop. The pi0.5 model itself runs on a separate **GPU server** using the [openpi](https://github.com/Physical-Intelligence/openpi) repository.
-
 ```
-┌─────────────────────┐      websocket       ┌──────────────────────┐
-│   GPU server        │ ◄─────────────────► │  Robot laptop        │
-│   (openpi repo)     │                       │  (THIS repo)         │
-│                     │                       │                      │
-│  serve_policy.py    │                       │  main.py             │
-│  pi0.5 checkpoint   │  ◄── annotated img ── │  + trajectory overlay│
-│                     │  ──── actions ────►   │  + DROID robot I/O   │
-└─────────────────────┘                       └──────────────────────┘
+┌──────────────────┐   websocket   ┌───────────────────┐
+│  GPU host        │ ◄──────────► │  Robot laptop     │
+│  openpi server   │               │  main[_pi05].py   │
+│  :8000           │               │  + Franka + ZEDs  │
+└──────────────────┘               └───────────────────┘
 ```
 
-## Pipeline
+Two client scripts share camera handling (ZED BGRA→RGB, 180° rotate externals,
+wrist unrotated) and the same websocket protocol:
 
-1. **Instruction decomposition** (GPT-4o-mini): Breaks task into manipulation steps
-2. **Object detection** (Gemini Robotics-ER): Locates objects in camera image
-3. **Trajectory generation** (GPT-4o-mini): Predicts 10-15 manipulation waypoints
-4. **Trajectory drawing** (local): Draws trajectory on `exterior_image_1_left` using training-matched `TraceOverlayConfig` (red→pink gradient, yellow dot, black outline)
-5. **Policy inference**: Sends annotated 224×224 image to pi0.5 policy server via websocket
-6. **Action execution**: Runs returned actions on the Franka via DROID's `RobotEnv`
-7. **Re-planning**: Every `plan_freq` steps, re-detects objects and updates trajectory
+- **`main.py`** — GPT decomposition → Gemini ER object localization →
+  GPT waypoints → red→pink overlay with yellow dot drawn on the exterior frame
+  → sent to policy. Pair with an overlay-trained checkpoint (e.g.
+  `brandonyang/pi05_droid_trajectory_overlay`, `ASethi04/pi05-chris-traces-v1`).
+- **`main_pi05.py`** — raw frame + instruction as `prompt`, no LLM in the loop.
+  Pair with vanilla pi0.5-droid (`gs://openpi-assets/checkpoints/pi05_droid`).
 
-## ─── Robot Laptop Setup (this repo) ───
-
-### 1. Clone and install
+## Setup
 
 ```bash
-git clone https://github.com/AmishSethi/pi-trajectory-overlay.git
-cd pi-trajectory-overlay
-pip install -r requirements.txt
+pip install -r requirements.txt   # jax, openpi_client, cv2, google-genai, openai, tyro, ...
+cat > .env <<'EOF'
+GEMINI_API_KEY=<your_key>
+OPENAI_API_KEY=<your_key>
+EOF
+chmod 600 .env
 ```
+`.env` is git-ignored. Only `main.py` needs the keys.
 
-You also need [DROID's robot infrastructure](https://github.com/droid-dataset/droid) installed on the laptop — that provides `droid.robot_env.RobotEnv` which talks to the Franka.
+DROID's `RobotEnv` and `pyzed` must be installed separately (usually via a
+conda env; this rig uses `eva_jiani_env`).
 
-### 2. Set API keys
+## Run
+
+Launch a policy server on a GPU box (openpi's `scripts/serve_policy.py`),
+then on the laptop:
 
 ```bash
-export GEMINI_API_KEY="your-gemini-api-key"
-export OPENAI_API_KEY="your-openai-api-key"
-```
-
-Or create a `.env` file (git-ignored) with those two lines.
-
-### 3. Run inference
-
-```bash
-python main.py \
-    --remote-host <GPU_SERVER_IP> \
-    --remote-port 8000 \
+# LLM + trajectory-overlay client
+python -u main.py \
+    --remote-host <SERVER_IP> --remote-port 8000 \
     --external-camera left \
-    --left-camera-id <your_zed_left_serial> \
-    --right-camera-id <your_zed_right_serial> \
-    --wrist-camera-id <your_zed_wrist_serial>
+    --left-camera-id  <id> --right-camera-id <id> --wrist-camera-id <id> \
+    --save-frames --save-dir runs
+
+# No-LLM client (for vanilla pi0.5-droid)
+python -u main_pi05.py \
+    --remote-host <SERVER_IP> --remote-port 8000 \
+    --external-camera left \
+    --left-camera-id  <id> --right-camera-id <id> --wrist-camera-id <id> \
+    --save-frames --save-dir runs_pi05
 ```
 
-You will be prompted for a task instruction (e.g. "Pick up the red block and put it in the bowl"). Press Ctrl+C or `q` in the display window to stop early.
+See `run_laptop.sh` for the launcher wrapper used on this rig.
 
-## ─── GPU Server Setup (openpi repo) ───
+## Key flags (`main.py`)
 
-The policy server is part of the [openpi](https://github.com/Physical-Intelligence/openpi) repository, not this one. On the GPU machine:
+| Flag | Default | Effect |
+|---|---|---|
+| `--plan-freq` | 150 | re-plan every N env steps (Gemini + GPT, ~5–10 s each) |
+| `--max-plan-count` | 20 | cap on re-plans per rollout |
+| `--open-loop-horizon` | 8 | actions executed per policy query (chunk is 16) |
+| `--save-frames` | false | dump 5 JPEGs/step to `<run>/frames/` — survives `pkill -9` |
+| `--no-show-display` | — | disable OpenCV live window (needed for ssh/headless) |
+| `--no-overlay` | false | ablation — don't draw trajectory |
 
-### 1. Clone and install openpi
+`main_pi05.py` has the camera/remote flags plus `--save-frames`, no planning.
+
+## Per-rollout outputs (`<save-dir>/<timestamp>/`)
+
+`instruction.txt`, `actions.log` (per-step), `rollout.mp4` (graceful exit),
+`result.txt` (`y/n` prompt). With `--save-frames`:
+`frames/NNNN_{ext_raw,ext_annotated,wrist,ext_224,wrist_224}.jpg`. `main.py`
+additionally writes `traj_NNNN.jpg`, `planning_report_NNNN.txt`,
+`trajectories.json`, `viz/{debug_frames,raw_frames,annotated_frames}/`.
+
+## Kill
 
 ```bash
-git clone https://github.com/Physical-Intelligence/openpi.git
-cd openpi
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+tmux kill-session -t rollout 2>/dev/null; pkill -9 -f pi-trajectory-overlay/main
 ```
-
-### 2. Download the trajectory-overlay checkpoint
-
-```bash
-# From anywhere on the GPU machine
-huggingface-cli download brandonyang/pi05_droid_trajectory_overlay \
-    --local-dir ~/checkpoints/pi05_droid_trajectory_overlay
-```
-
-### 3. Start the policy server
-
-```bash
-# From inside the openpi repo
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid_finetune \
-    --policy.dir=~/checkpoints/pi05_droid_trajectory_overlay
-```
-
-The server listens on port 8000 by default. Make sure the GPU machine is reachable from the robot laptop.
-
-## Key Arguments (`main.py`)
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--external-camera` | (required) | `"left"` or `"right"` — which external camera to use |
-| `--remote-host` | `0.0.0.0` | Policy server IP |
-| `--remote-port` | `8000` | Policy server port |
-| `--open-loop-horizon` | `8` | Actions executed per policy query |
-| `--plan-freq` | `10` | Re-plan trajectory every N steps |
-| `--max-plan-count` | `20` | Max replanning calls per rollout |
-| `--trajectory-source` | `gpt` | `gpt`, `retrieval`, or `fallback` |
-| `--gpt-model` | `gpt-4o-mini` | OpenAI model for trajectory generation |
-| `--gemini-model` | `gemini-robotics-er-1.5-preview` | Gemini model for object detection |
-| `--no-overlay` | `false` | Disable trajectory overlay (ablation) |
-| `--save-dir` | `trajectory_overlay_runs` | Output directory |
-| `--show-display` | `true` | Show live OpenCV debug window |
-
-## Trajectory Sources
-
-This repo supports two trajectory generation methods:
-
-- **`gpt`** (default): Gemini detects objects, GPT plans 10-15 waypoints. Fast (~5s/plan), no preprocessed data needed.
-- **`retrieval`**: Retrieves the most similar DROID episode, warps its SAM2 trajectory using Gemini correspondence. Slower (~60s/plan), requires preprocessed DROID 5K data. See `trajectory_source.py` for paths.
-- **`fallback`**: Try `retrieval` first, fall back to `gpt` on failure.
-
-## Output
-
-Each run saves to `<save-dir>/<timestamp>/`:
-- `instruction.txt` — the task instruction
-- `traj_NNNN.jpg` — trajectory overlay visualization at each planning step
-- `trajectories.json` — all predicted trajectories with metadata
-- `rollout.mp4` — video of the rollout
-- `result.txt` — success/failure and statistics
-- `viz/debug_frames/` — per-frame debug panels (raw + annotated + wrist + info)
-
-## TraceOverlayConfig (Training Defaults)
-
-The trajectory is drawn with `TraceOverlayConfig()` defaults matching `build_dataset.py` from [branyang02/temp_drawing](https://github.com/branyang02/temp_drawing/tree/main/droid_trajectory):
-- **Line**: red `(255,0,0)` → pink `(255,105,180)` gradient, thickness=3
-- **Outline**: black `(0,0,0)`, thickness=5
-- **Yellow dot**: radius=5, color `(255,255,0)`, black outline thickness=2. Position (`current_index`) advances each frame.
-- **Spline interpolation**: `num_interpolated=100` at inference (sparse GPT waypoints → dense visual curve)
-- **No arrows, dashes, tick marks, or past trajectory**
-
-Changing these will cause train/test mismatch and degrade policy performance.
+Same command for both clients — session name is always `rollout`, the `main`
+prefix matches `main.py` and `main_pi05.py`.
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/
 ```
+**154 tests**: unit (drawing, image pipeline, schema parsing, camera flip,
+plan-once merge, IPv4 patch), live ZED hardware, real Gemini + real OpenAI.
+Hardware/API tests skip automatically if unavailable.
 
-97 unit tests covering drawing, coordinate transforms, API mocking, and pipeline simulation.
+## Notes
 
-## Batch Evaluation
-
-To evaluate trajectory quality across many DROID episodes without a real robot:
-
-```bash
-python batch_evaluate.py --start 0 --end 100 --output-dir batch_results/run1
-```
-
-Produces per-episode quality classification (good/partial/fail) and a summary JSON.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `main.py` | Standalone inference entry point — runs on robot laptop |
-| `traj_vis_utils.py` | Trajectory drawing with training-matched `TraceOverlayConfig` |
-| `trajectory_predictor.py` | Gemini object detection + GPT waypoint generation |
-| `trajectory_source.py` | Unified interface for `gpt` / `retrieval` / `fallback` sources |
-| `inference_visualizer.py` | Real-time OpenCV debug display |
-| `generate_examples.py` | Gallery generator for visual examples |
-| `batch_evaluate.py` | Batch evaluation harness |
-| `tests/` | 97 unit tests |
+- **Trajectory overlay is stable within a plan window.** Waypoints and the
+  yellow-dot `current_index` do not move until the next `--plan-freq` fires.
+  Advancing by time would collapse the drawn line regardless of real progress.
+- **IPv4-only DNS patch.** `trajectory_predictor.py` monkey-patches
+  `socket.getaddrinfo` at import to strip AF_INET6 — UPenn SEAS silently drops
+  IPv6 replies, making Gemini calls hang for 60–90 s otherwise. Set
+  `ALLOW_IPV6=1` to disable.
+- **Re-planning reuses the cached end point** (`PlanningState.current_end_point`)
+  so the target stays stable while the manipulating object's position updates
+  each plan.
+- **Instruction-decomposition cache** lives at `<save-dir>/instruction_cache.json`
+  — repeat tasks skip the GPT decomposition call.
