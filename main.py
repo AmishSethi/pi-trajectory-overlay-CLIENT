@@ -82,11 +82,16 @@ class Args:
     remote_port: int = 8000
 
     # Trajectory prediction
+    trajectory_source: str = "gpt"  # "gpt", "retrieval", or "fallback"
     gpt_model: str = "gpt-4o-mini"
     gemini_model: str = "gemini-robotics-er-1.5-preview"
     plan_freq: int = 10  # Re-plan every N steps
     max_plan_count: int = 20  # Max replanning calls per trajectory
     check_interval: int = 20  # Check step completion every N steps since last plan
+
+    # Retrieval+warp settings (only used when trajectory_source="retrieval" or "fallback")
+    droid_5k_root: str = "/home/jianih/common-data/jiani_common/DROID_5K_processed"
+    tether_root: str = "/home/asethi04/ROBOTICS/tether"
 
     # Output
     save_dir: str = "trajectory_overlay_runs"
@@ -389,8 +394,28 @@ def main(args: Args):
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
     print(f"Connected to policy server at {args.remote_host}:{args.remote_port}")
 
-    # TraceOverlayConfig with training defaults (magenta, thickness=1, no outline)
+    # TraceOverlayConfig with training defaults (red-to-pink gradient, yellow dot)
     overlay_config = TraceOverlayConfig()
+
+    # Initialize trajectory source
+    from trajectory_source import GPTTrajectorySource, RetrievalWarpTrajectorySource, FallbackTrajectorySource
+    if args.trajectory_source == "gpt":
+        traj_source = GPTTrajectorySource(gpt_model=args.gpt_model, gemini_model=args.gemini_model)
+        print(f"Trajectory source: GPT ({args.gpt_model})")
+    elif args.trajectory_source == "retrieval":
+        traj_source = RetrievalWarpTrajectorySource(
+            droid_5k_root=args.droid_5k_root, tether_root=args.tether_root, gemini_model=args.gemini_model,
+        )
+        print(f"Trajectory source: Retrieval+Warp (data: {args.droid_5k_root})")
+    elif args.trajectory_source == "fallback":
+        retrieval = RetrievalWarpTrajectorySource(
+            droid_5k_root=args.droid_5k_root, tether_root=args.tether_root, gemini_model=args.gemini_model,
+        )
+        gpt = GPTTrajectorySource(gpt_model=args.gpt_model, gemini_model=args.gemini_model)
+        traj_source = FallbackTrajectorySource(retrieval, gpt)
+        print(f"Trajectory source: Fallback (retrieval → GPT)")
+    else:
+        raise ValueError(f"Unknown trajectory source: {args.trajectory_source}")
 
     # Visualizer
     visualizer = InferenceVisualizer(

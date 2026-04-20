@@ -1,0 +1,39 @@
+# Robot laptop side: trajectory overlay inference client for pi0.5
+#
+# The GPU server side uses the openpi repo (https://github.com/Physical-Intelligence/openpi)
+# and is NOT installed from here.
+
+# Core image + trajectory drawing
+numpy>=1.22,<2.0
+Pillow>=10.0
+opencv-python>=4.9
+scipy>=1.11
+matplotlib>=3.8
+
+# LLM APIs for trajectory prediction
+openai>=1.50
+google-genai>=0.3
+
+# Policy server client (subset of openpi)
+openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client
+msgpack>=1.0
+msgpack-numpy>=0.4.8
+websockets>=12
+
+# Video / image I/O — imageio used for rollout videos, av optional (only for retrieval source and batch_evaluate.py)
+imageio>=2.34
+# av>=11            # uncomment if using --trajectory-source retrieval or running batch_evaluate.py
+
+# Optional: hub access for source DROID frames (only needed for batch_evaluate.py + retrieval source)
+# huggingface-hub>=0.23
+# polars>=0.20
+
+# CLI argument parsing
+tyro>=0.8
+tqdm>=4.66
+
+# Run loop utilities
+moviepy==1.0.3
+
+# Tests
+pytest>=8.0
