@@ -85,7 +85,7 @@ class Args:
     trajectory_source: str = "gpt"  # "gpt", "retrieval", or "fallback"
     gpt_model: str = "gpt-4o-mini"
     gemini_model: str = "gemini-robotics-er-1.5-preview"
-    plan_freq: int = 10  # Re-plan every N steps
+    plan_freq: int = 150  # Re-plan every N env steps (Gemini + GPT pipeline is expensive — ~5-10s per call)
     max_plan_count: int = 20  # Max replanning calls per trajectory
     check_interval: int = 20  # Check step completion every N steps since last plan
 
@@ -99,9 +99,13 @@ class Args:
 
     # Visualization
     show_display: bool = True  # Show live OpenCV debug window
-    save_debug_frames: bool = True  # Save debug frames to disk
+    save_debug_frames: bool = True  # Save InferenceVisualizer 4-panel debug frames to viz/ (default every 5 steps)
     display_width: int = 320  # Width of each panel in debug display
-    save_frames_every: int = 5  # Save a debug frame every N steps
+    save_frames_every: int = 5  # Save a debug (visualizer) frame every N steps
+
+    # Raw per-step dump (ext + wrist, full-res + 224x224) into <run_dir>/frames/.
+    # Every step, flushed per write — safe to hard-kill. ~175 KB/step. Off by default.
+    save_frames: bool = False
 
     # Instruction cache
     instruction_cache_path: str | None = None
@@ -134,8 +138,14 @@ def prevent_keyboard_interrupt():
 # ---------------------------------------------------------------------------
 
 def _extract_observation(args: Args, obs_dict: dict) -> dict:
-    """Extract images and robot state from DROID observation dict."""
-    image_observations = obs_dict["image"]
+    """Extract images and robot state from DROID observation dict.
+
+    Only the external camera selected by args.external_camera and the wrist
+    camera are REQUIRED (those are what the policy consumes). The right camera
+    is optional — if external_camera is 'left' we don't need right at all, and
+    vice versa. This lets us run even if a non-policy camera is offline.
+    """
+    image_observations = obs_dict.get("image", {})
     left_image, right_image, wrist_image = None, None, None
     for key in image_observations:
         if args.left_camera_id in key and "left" in key:
@@ -145,14 +155,43 @@ def _extract_observation(args: Args, obs_dict: dict) -> dict:
         elif args.wrist_camera_id in key and "left" in key:
             wrist_image = image_observations[key]
 
-    # Drop alpha, convert BGR to RGB
-    for name, img in [("left", left_image), ("right", right_image), ("wrist", wrist_image)]:
-        if img is None:
-            raise RuntimeError(f"Missing {name} camera image. Check camera IDs.")
+    # Required cameras: the one selected as external + wrist
+    required = [("wrist", wrist_image)]
+    if args.external_camera == "left":
+        required.append(("left", left_image))
+    else:
+        required.append(("right", right_image))
 
-    left_image = left_image[..., :3][..., ::-1]
-    right_image = right_image[..., :3][..., ::-1]
-    wrist_image = wrist_image[..., :3][..., ::-1]
+    for name, img in required:
+        if img is None:
+            available = list(image_observations.keys())
+            raise RuntimeError(
+                f"Missing {name} camera image. Check camera IDs.\n"
+                f"  args.left_camera_id={args.left_camera_id!r}\n"
+                f"  args.right_camera_id={args.right_camera_id!r}\n"
+                f"  args.wrist_camera_id={args.wrist_camera_id!r}\n"
+                f"  args.external_camera={args.external_camera!r}\n"
+                f"  Available image keys: {available}\n"
+                f"  Top-level obs keys:   {list(obs_dict.keys())}"
+            )
+
+    def _to_rgb(img):
+        if img is None:
+            return None
+        return img[..., :3][..., ::-1]
+
+    left_image = _to_rgb(left_image)
+    right_image = _to_rgb(right_image)
+    wrist_image = _to_rgb(wrist_image)
+
+    # The two external ZED 2 cameras on this Franka rig are mounted 180°
+    # rotated (upside-down AND mirrored) relative to the DROID training-image
+    # convention, so apply a full 180° rotation — flip both axes. The wrist
+    # ZED-M is mounted correctly and is left alone.
+    if left_image is not None:
+        left_image = np.ascontiguousarray(left_image[::-1, ::-1])
+    if right_image is not None:
+        right_image = np.ascontiguousarray(right_image[::-1, ::-1])
 
     robot_state = obs_dict["robot_state"]
     return {
@@ -215,6 +254,7 @@ class PlanningState:
     plan_count: int = 0
     steps_since_last_plan: int = 0
     full_task: str = ""  # the original complete instruction
+    _last_object_locations: dict | None = None  # populated by _predict_trajectory
 
     def reset_step(self):
         self.pred_traj = None
@@ -301,9 +341,14 @@ def _predict_trajectory(
 
     # Detect objects (with automatic retry for missing ones)
     object_locations = query_target_location(api_img, detect_queries, model_name=args.gemini_model)
+    planning._last_object_locations = object_locations  # expose for reports
     if object_locations is None:
         print("[trajectory] Object detection failed completely")
         return None
+    # Log Gemini detections clearly
+    print(f"[Gemini] Detected {len(object_locations)} object(s):")
+    for k, v in object_locations.items():
+        print(f"    {k!r}: ({v[0]:.1f}, {v[1]:.1f})")
 
     manip_pt = object_locations.get(manipulating_object)
     target_pt = object_locations.get(target_related_object) if target_related_object else None
@@ -391,6 +436,29 @@ def main(args: Args):
     env = RobotEnv(action_space="joint_velocity", gripper_action_space="position")
     print("Created DROID env")
 
+    # Warm up cameras — only require the external camera we use + wrist.
+    # ZED-M (wrist) can take 20-40s to enumerate after replug.
+    print("Warming up cameras (up to 60s)...")
+    max_attempts = 120
+    required_ext_id = args.left_camera_id if args.external_camera == "left" else args.right_camera_id
+    for attempt in range(max_attempts):
+        obs = env.get_observation()
+        img_dict = obs.get("image", {})
+        keys = list(img_dict.keys()) if isinstance(img_dict, dict) else []
+        have_ext = any(required_ext_id in k and "left" in k for k in keys)
+        have_wrist = any(args.wrist_camera_id in k and "left" in k for k in keys)
+        if have_ext and have_wrist:
+            print(f"  Cameras warmed up after {attempt + 1} attempts; got keys: {keys}")
+            break
+        if attempt % 10 == 0 or attempt < 5:
+            print(f"  [warmup {attempt + 1}/{max_attempts}] image keys: {keys}; "
+                  f"have_{args.external_camera}={have_ext} have_wrist={have_wrist}")
+        time.sleep(0.5)
+    else:
+        print(f"WARNING: cameras did not fully warm up in {max_attempts * 0.5}s, continuing anyway")
+        print(f"  Final image keys: {keys}")
+        print(f"  have_{args.external_camera}={have_ext} have_wrist={have_wrist}")
+
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
     print(f"Connected to policy server at {args.remote_host}:{args.remote_port}")
 
@@ -465,12 +533,40 @@ def main(args: Args):
         for i, s in enumerate(planning.steps):
             print(f"  {i + 1}. {s['step']} (manipulate: {s['manipulating_object']}, target: {s['target_location']})")
 
+        # Plan-once mode: merge all decomposed steps into ONE synthetic step that
+        # covers the WHOLE task. This ensures GPT plans a trajectory from the
+        # starting object to the FINAL target (not just the first-step lift).
+        if args.max_plan_count == 1 and len(planning.steps) > 1:
+            first = planning.steps[0]
+            last = planning.steps[-1]
+            merged = {
+                "step": instruction,  # use the full user instruction
+                "manipulating_object": first["manipulating_object"],
+                "target_related_object": (
+                    last.get("target_related_object")
+                    or first.get("target_related_object", "")
+                ),
+                "target_location": (
+                    last.get("target_location")
+                    or first.get("target_location", "")
+                ),
+            }
+            print(f"\n[plan-once] Merging {len(planning.steps)} steps into one:")
+            print(f"  manipulate: {merged['manipulating_object']}")
+            print(f"  target_related: {merged['target_related_object']}")
+            print(f"  target_location: {merged['target_location']}")
+            planning.steps = [merged]
+
         current_instruction = planning.steps[0]["step"]
 
         # --- Step 2: Run rollout ---
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H-%M-%S")
         run_dir = os.path.join(args.save_dir, timestamp)
         os.makedirs(run_dir, exist_ok=True)
+        frames_dir = os.path.join(run_dir, "frames")
+        if args.save_frames:
+            os.makedirs(frames_dir, exist_ok=True)
+            print(f"Per-step frames → {frames_dir}")
 
         # Save instruction
         with open(os.path.join(run_dir, "instruction.txt"), "w") as f:
@@ -569,41 +665,94 @@ def main(args: Args):
                                 "step_idx": planning.step_idx,
                                 "trajectory": traj,
                             })
+
+                            # Also write a human-readable planning report
+                            report_path = os.path.join(run_dir, f"planning_report_{t_step:04d}.txt")
+                            with open(report_path, "w", encoding="utf-8") as rf:
+                                rf.write("=" * 78 + "\n")
+                                rf.write(f"  PLANNING REPORT — t_step={t_step}\n")
+                                rf.write("=" * 78 + "\n\n")
+                                rf.write(f"Full task:       {planning.full_task}\n")
+                                rf.write(f"Current step:    {planning.current_step['step'] if planning.current_step else 'N/A'}\n")
+                                rf.write(f"Manipulating:    {planning.current_step.get('manipulating_object') if planning.current_step else ''}\n")
+                                rf.write(f"Target related:  {planning.current_step.get('target_related_object') if planning.current_step else ''}\n")
+                                rf.write(f"Target location: {planning.current_step.get('target_location') if planning.current_step else ''}\n\n")
+                                rf.write(f"GPT reasoning:\n  {traj.get('reasoning', '(none)')}\n\n")
+                                sp = traj.get("start_point")
+                                ep = traj.get("end_point")
+                                pts = traj.get("trajectory", [])
+                                if sp:
+                                    rf.write(f"Start pixel (x, y):  ({sp[0]:.1f}, {sp[1]:.1f})\n")
+                                if ep:
+                                    rf.write(f"End pixel   (x, y):  ({ep[0]:.1f}, {ep[1]:.1f})\n")
+                                if sp and ep:
+                                    dx = ep[0] - sp[0]
+                                    dy = ep[1] - sp[1]
+                                    disp = (dx * dx + dy * dy) ** 0.5
+                                    img_w = ext_image.shape[1]
+                                    img_h = ext_image.shape[0]
+                                    rf.write(f"Displacement:       ({dx:+.1f}, {dy:+.1f})  ->  length {disp:.1f}px "
+                                             f"({100 * disp / max(img_w, img_h):.1f}% of image)\n")
+                                rf.write(f"Trajectory has {len(pts)} waypoints:\n")
+                                for i, p in enumerate(pts):
+                                    rf.write(f"    {i:2d}. ({p[0]:7.1f}, {p[1]:7.1f})\n")
+                                rf.write("\n")
+                                if getattr(planning, "_last_object_locations", None):
+                                    rf.write("Gemini detections (pixel coords on API-sized image):\n")
+                                    for k, v in planning._last_object_locations.items():
+                                        rf.write(f"    {k!r}: ({v[0]:.1f}, {v[1]:.1f})\n")
+                            print(f"[planning] Wrote report: {report_path}")
                 else:
                     planning.steps_since_last_plan += 1
 
                 # --- Draw trajectory overlay on exterior image ---
-                # During training, current_index advanced 1 per frame across ~160
-                # trajectory points.  At inference, the GPT trajectory has only
-                # ~3-10 points but the robot runs ~160 steps between re-plans.
-                # We map robot steps proportionally into trajectory point space
-                # so the dot traverses the line at the same visual rate as training.
+                # Keep the trajectory stable — dot frozen at waypoint 0, full
+                # line drawn — until the next Gemini + GPT re-plan fires.
+                # Advancing the dot by time would collapse the drawn line
+                # regardless of whether the robot actually made progress, which
+                # could mislead the policy. The dot position only updates when
+                # a new plan arrives (whose waypoint 0 is the freshly-detected
+                # object location).
                 annotated_ext_image = ext_image.copy()
                 if not args.no_overlay and planning.pred_traj is not None:
                     traj_pts = planning.pred_traj.get("trajectory", [])
-                    n_traj = len(traj_pts)
-                    if n_traj >= 2 and args.plan_freq > 0:
-                        # Map steps_since_last_plan ∈ [0, plan_freq) → [0, n_traj-1]
-                        frac = planning.steps_since_last_plan / args.plan_freq
-                        traj_current_idx = min(int(frac * (n_traj - 1)), n_traj - 1)
-                    else:
-                        traj_current_idx = 0
-                    annotated_ext_image = _draw_trajectory_on_image(
-                        ext_image, traj_pts, current_index=traj_current_idx, config=overlay_config,
-                    )
+                    if len(traj_pts) >= 2:
+                        annotated_ext_image = _draw_trajectory_on_image(
+                            ext_image, traj_pts, current_index=0, config=overlay_config,
+                        )
 
                 video_frames.append(ext_image)  # Save raw for video
 
-                # --- Policy inference ---
-                model_input_ext = None
-                model_input_wrist = None
-                inference_start = time.time()
+                # Compute 224x224 model inputs every step so we can save them to
+                # disk via --save-frames and reuse at query time. These are the
+                # EXACT tensors sent to the policy server.
+                model_input_ext = image_tools.resize_with_pad(annotated_ext_image, 224, 224)
+                model_input_wrist = image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224)
 
+                # --- Optional per-step raw frame dump (--save-frames) ---
+                # Each .save() call flushes to the OS, so a SIGKILL leaves all
+                # completed-step frames on disk. Off by default.
+                if args.save_frames:
+                    Image.fromarray(ext_image).save(
+                        os.path.join(frames_dir, f"{t_step:04d}_ext_raw.jpg"), quality=85,
+                    )
+                    Image.fromarray(annotated_ext_image).save(
+                        os.path.join(frames_dir, f"{t_step:04d}_ext_annotated.jpg"), quality=85,
+                    )
+                    Image.fromarray(curr_obs["wrist_image"]).save(
+                        os.path.join(frames_dir, f"{t_step:04d}_wrist.jpg"), quality=85,
+                    )
+                    Image.fromarray(model_input_ext).save(
+                        os.path.join(frames_dir, f"{t_step:04d}_ext_224.jpg"), quality=90,
+                    )
+                    Image.fromarray(model_input_wrist).save(
+                        os.path.join(frames_dir, f"{t_step:04d}_wrist_224.jpg"), quality=90,
+                    )
+
+                # --- Policy inference ---
+                inference_ms = 0.0
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                     actions_from_chunk_completed = 0
-
-                    model_input_ext = image_tools.resize_with_pad(annotated_ext_image, 224, 224)
-                    model_input_wrist = image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224)
 
                     request_data = {
                         "observation/exterior_image_1_left": model_input_ext,
@@ -613,10 +762,10 @@ def main(args: Args):
                         "prompt": current_instruction,
                     }
 
+                    inference_start = time.time()
                     with prevent_keyboard_interrupt():
                         pred_action_chunk = policy_client.infer(request_data)["actions"]
-
-                inference_ms = (time.time() - inference_start) * 1000
+                    inference_ms = (time.time() - inference_start) * 1000
 
                 # Select action from chunk
                 action = pred_action_chunk[actions_from_chunk_completed]
@@ -630,6 +779,22 @@ def main(args: Args):
 
                 action = np.clip(action, -1, 1)
                 env.step(action)
+
+                # --- Log this step to actions.log (easy to tail) ---
+                action_log_path = os.path.join(run_dir, "actions.log")
+                with open(action_log_path, "a") as alf:
+                    traj_pts_now = (
+                        planning.pred_traj.get("trajectory", [])
+                        if planning.pred_traj else []
+                    )
+                    alf.write(
+                        f"t={t_step:04d} | "
+                        f"action={np.round(action, 3).tolist()} | "
+                        f"gripper={action[-1]:.2f} | "
+                        f"chunk_idx={actions_from_chunk_completed}/{args.open_loop_horizon} | "
+                        f"traj_pts={len(traj_pts_now)} | "
+                        f"inf_ms={inference_ms:.0f}\n"
+                    )
 
                 # --- Update visualization ---
                 viz_info.t_step = t_step

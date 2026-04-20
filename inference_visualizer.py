@@ -132,9 +132,9 @@ class InferenceVisualizer:
                   fill=(180, 180, 180), font=font_small)
         y += line_h
 
-        # Config reminder (dim)
+        # Config reminder (dim) — matches TraceOverlayConfig() defaults
         draw.text((8, y),
-                  "Config: magenta (255,0,255) t=1 no-outline [TRAINING MATCH]",
+                  "Config: red->pink gradient t=3, black outline=5, yellow dot r=5 [TRAINING MATCH]",
                   fill=(120, 120, 120), font=font_small)
 
         return np.array(panel)
