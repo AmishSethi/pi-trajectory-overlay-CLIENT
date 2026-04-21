@@ -3,7 +3,11 @@ __pycache__/
 *.pyc
 example_outputs/
 *.egg-info/
+.venv/
 
 # Per-rollout output directories (videos, frames, planning reports, actions.log)
 runs/
 runs_pi05/
+runs_robolab/
+simulator/runs/
+simulator/runs_robolab/
