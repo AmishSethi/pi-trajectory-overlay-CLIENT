@@ -8,3 +8,6 @@ example_outputs/
 # Per-rollout output directories (videos, frames, planning reports, actions.log)
 runs/
 runs_pi05/
+runs_robolab/
+simulator/runs/
+simulator/runs_robolab/
