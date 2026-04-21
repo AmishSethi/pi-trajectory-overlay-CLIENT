@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 example_outputs/
 *.egg-info/
+.venv/
 
 # Per-rollout output directories (videos, frames, planning reports, actions.log)
 runs/
