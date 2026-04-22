@@ -77,24 +77,20 @@ _REAL_K_INTRINSICS = np.array(
     dtype=np.float32,
 )
 
-_REAL_EXTRINSIC_FALLBACK = np.array(
-    # Aurora DROID calibration snapshot for 26368109_left as of 2026-03-31
-    # (vlmanipulation_aurora/droid/calibration/calibration_info.json -> "pose").
-    # Scipy 'xyz' Euler + meters; cam_in_base frame; updated whenever the
-    # external ZED is physically moved. Hardcoded only as a failsafe when all
-    # JSON search paths are missing.
-    [-0.037086345956874434, 0.6422724558218917, 0.7621518073970956,
-     -2.049719317418595, -0.002923682412273365, -2.319966451084489],
-    dtype=np.float32,
-)
-
 # Calibration JSON search order (first existing file wins). Both DROID's native
 # format (key "pose") and eva_pal_share's ("extrinsics") are supported.
+# The repo-local copy at calibration/calibration_info.json is a version-controlled
+# snapshot of the laptop's live calibration, so there is always a known-good
+# baseline without any hardcoded-in-source fallback. When the robot is
+# recalibrated, copy the updated laptop file into this repo and commit.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CALIBRATION_JSON_SEARCH_PATHS = (
-    # Laptop-side DROID calibration (freshest — updated by charuco calibration flow)
+    # Laptop-side DROID calibration (freshest — updated by charuco flow on-rig)
     "/home/franka/vlmanipulation_aurora/droid/calibration/calibration_info.json",
     "/home/franka/droid_p2r/droid/calibration/calibration_info.json",
-    # GPU-box-side snapshot
+    # Repo-tracked snapshot — always available, updated by committing a new copy
+    os.path.join(_THIS_DIR, "calibration", "calibration_info.json"),
+    # Historical GPU-box-side snapshot (eva_pal_share format)
     "/home/asethi04/ROBOTICS/eva_pal_share/eva/utils/calibration.json",
 )
 
@@ -113,7 +109,10 @@ _REAL_EE_OFFSET_FROM_FLANGE = 0.0
 
 def _load_extrinsics(override_path: str = "", camera_key: str = "26368109_left") -> np.ndarray:
     """Load camera-in-base 6-vec for ``camera_key`` from a DROID or eva_pal_share
-    calibration JSON. Falls back to the hardcoded copy if no file matches.
+    calibration JSON. Tries the override path first (if set), then
+    :data:`_CALIBRATION_JSON_SEARCH_PATHS` in order. Raises FileNotFoundError if
+    no usable calibration is found — there is no hardcoded fallback, so a
+    misconfigured robot fails loudly at launch instead of silently drifting.
 
     DROID format:        ``{"26368109_left": {"pose": [...], "timestamp": ...}}``
     eva_pal_share format: ``{"26368109_left": {"extrinsics": [...], ...}}``
@@ -121,8 +120,12 @@ def _load_extrinsics(override_path: str = "", camera_key: str = "26368109_left")
     Either field name is accepted; we prefer "pose" (newer DROID convention).
     """
     paths = [override_path] if override_path else list(_CALIBRATION_JSON_SEARCH_PATHS)
+    tried: list[str] = []
     for p in paths:
-        if not p or not os.path.exists(p):
+        if not p:
+            continue
+        tried.append(p)
+        if not os.path.exists(p):
             continue
         try:
             with open(p, encoding="utf-8") as f:
@@ -141,10 +144,15 @@ def _load_extrinsics(override_path: str = "", camera_key: str = "26368109_left")
         iso = _dt.datetime.fromtimestamp(ts).isoformat() if ts else "no-ts"
         print(f"[mpc] loaded {camera_key} extrinsics from {p} (calibrated {iso})")
         return np.asarray(vec, dtype=np.float32)
-    print(f"[mpc] no calibration file found for {camera_key}; using hardcoded fallback.")
-    return _REAL_EXTRINSIC_FALLBACK.copy()
+    raise FileNotFoundError(
+        f"No usable calibration found for {camera_key}. Tried: {tried}. "
+        f"Commit a fresh calibration_info.json to the repo's calibration/ "
+        f"directory or pass --calibration-json <path> explicitly."
+    )
 
 
+# Module-level probe so import-time failures surface in the launch log, not
+# buried inside the first rollout call.
 _CACHED_EXTRINSIC = _load_extrinsics()
 
 
