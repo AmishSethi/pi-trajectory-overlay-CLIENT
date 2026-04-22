@@ -78,12 +78,25 @@ _REAL_K_INTRINSICS = np.array(
 )
 
 _REAL_EXTRINSIC_FALLBACK = np.array(
-    [0.09153819431911293, -0.01455634604254126, 0.2287419968377015,
-     -1.5253417996893945, 0.019538164296171168, -1.55553965929186],
+    # Aurora DROID calibration snapshot for 26368109_left as of 2026-03-31
+    # (vlmanipulation_aurora/droid/calibration/calibration_info.json -> "pose").
+    # Scipy 'xyz' Euler + meters; cam_in_base frame; updated whenever the
+    # external ZED is physically moved. Hardcoded only as a failsafe when all
+    # JSON search paths are missing.
+    [-0.037086345956874434, 0.6422724558218917, 0.7621518073970956,
+     -2.049719317418595, -0.002923682412273365, -2.319966451084489],
     dtype=np.float32,
 )
 
-_CALIBRATION_JSON_PATH = "/home/asethi04/ROBOTICS/eva_pal_share/eva/utils/calibration.json"
+# Calibration JSON search order (first existing file wins). Both DROID's native
+# format (key "pose") and eva_pal_share's ("extrinsics") are supported.
+_CALIBRATION_JSON_SEARCH_PATHS = (
+    # Laptop-side DROID calibration (freshest — updated by charuco calibration flow)
+    "/home/franka/vlmanipulation_aurora/droid/calibration/calibration_info.json",
+    "/home/franka/droid_p2r/droid/calibration/calibration_info.json",
+    # GPU-box-side snapshot
+    "/home/asethi04/ROBOTICS/eva_pal_share/eva/utils/calibration.json",
+)
 
 # Franka Panda joint velocity limits (rad/s), from the FCI datasheet.
 _REAL_JOINT_VEL_SCALE = np.array(
@@ -98,14 +111,38 @@ _REAL_IMAGE_HW = (720, 1280)
 _REAL_EE_OFFSET_FROM_FLANGE = 0.0
 
 
-def _load_extrinsics() -> np.ndarray:
-    try:
-        with open(_CALIBRATION_JSON_PATH) as f:
-            calib = json.load(f)
-        return np.asarray(calib["26368109_left"]["extrinsics"], dtype=np.float32)
-    except (OSError, KeyError, json.JSONDecodeError) as e:
-        print(f"[mpc] calibration.json missing/invalid ({e!r}); using fallback extrinsics.")
-        return _REAL_EXTRINSIC_FALLBACK.copy()
+def _load_extrinsics(override_path: str = "", camera_key: str = "26368109_left") -> np.ndarray:
+    """Load camera-in-base 6-vec for ``camera_key`` from a DROID or eva_pal_share
+    calibration JSON. Falls back to the hardcoded copy if no file matches.
+
+    DROID format:        ``{"26368109_left": {"pose": [...], "timestamp": ...}}``
+    eva_pal_share format: ``{"26368109_left": {"extrinsics": [...], ...}}``
+
+    Either field name is accepted; we prefer "pose" (newer DROID convention).
+    """
+    paths = [override_path] if override_path else list(_CALIBRATION_JSON_SEARCH_PATHS)
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                calib = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[mpc] skipping calibration file {p}: {e!r}")
+            continue
+        entry = calib.get(camera_key)
+        if not isinstance(entry, dict):
+            continue
+        vec = entry.get("pose") or entry.get("extrinsics")
+        if vec is None or len(vec) != 6:
+            continue
+        ts = entry.get("timestamp", 0)
+        import datetime as _dt
+        iso = _dt.datetime.fromtimestamp(ts).isoformat() if ts else "no-ts"
+        print(f"[mpc] loaded {camera_key} extrinsics from {p} (calibrated {iso})")
+        return np.asarray(vec, dtype=np.float32)
+    print(f"[mpc] no calibration file found for {camera_key}; using hardcoded fallback.")
+    return _REAL_EXTRINSIC_FALLBACK.copy()
 
 
 _CACHED_EXTRINSIC = _load_extrinsics()
@@ -147,7 +184,11 @@ class Args:
 
     # Optional LLM planning (matches main.py's cadence).
     # 0 disables; >0 re-plans every N steps via Gemini-ER + GPT-4o-mini.
+    # When enabled, BOTH --manip-object and --target-object must be set
+    # (main_mpc.py skips main.py's GPT decomposition step).
     llm_plan_freq: int = 0
+    manip_object: str = ""   # e.g. "banana"
+    target_object: str = ""  # e.g. "bowl"
     gpt_model: str = "gpt-4o-mini"
     gemini_model: str = "gemini-robotics-er-1.5-preview"
 
@@ -176,6 +217,11 @@ class Args:
     mpc_gripper_reward_weight: float = 0.0
     mpc_gripper_zone_frac: float = 0.15
     mpc_gripper_force_override: bool = False
+
+    # Path to a DROID-format calibration_info.json (or eva_pal_share
+    # calibration.json). If empty, the search paths in
+    # _CALIBRATION_JSON_SEARCH_PATHS are tried in order.
+    calibration_json: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +301,7 @@ def _extract_observation(args: Args, obs_dict: dict) -> dict:
 # MPC helpers: build GuidanceSpec, run CEM, return refined chunk.
 # ---------------------------------------------------------------------------
 def _load_canned_waypoints(path: str) -> np.ndarray:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     wp = np.asarray(data["waypoints_px"], dtype=np.float32)
     if wp.ndim != 2 or wp.shape[-1] != 2 or wp.shape[0] < 2:
@@ -336,26 +382,66 @@ def _refine_chunk_with_mpc(
 
 
 # ---------------------------------------------------------------------------
-# LLM planning subprocess wrapper (optional). Uses the same Gemini+GPT flow
-# main.py uses — imported lazily so non-LLM runs don't need the API keys.
+# LLM planning (optional). Reuses main.py's pipeline verbatim (Gemini-ER for
+# object localisation, GPT-4o-mini for trajectory). The caller must pass the
+# object names up front (--manip-object / --target-object) — we don't run
+# GPT's multi-step decomposition here since main_mpc.py is single-step-only.
+# Imports are lazy so non-LLM runs don't require the google-genai / openai
+# packages at all.
 # ---------------------------------------------------------------------------
-def _llm_plan_waypoints(args: Args, ext_image: np.ndarray, instruction: str):
+def _llm_plan_waypoints(
+    args: "Args", ext_image: np.ndarray, instruction: str,
+) -> np.ndarray | None:
+    if not args.manip_object or not args.target_object:
+        print("[mpc/plan] --manip-object and --target-object are required for LLM planning. "
+              "Either pass both or switch to --canned-waypoints-json.")
+        return None
     from trajectory_predictor import (
-        encode_pil_image, query_target_location, query_trajectory, resize_for_api,
+        encode_pil_image, query_target_location, query_trajectory,
+        rescale_trajectory, resize_for_api,
     )
     pil = Image.fromarray(ext_image).convert("RGB")
-    resized, scale_x, scale_y = resize_for_api(pil)
-    b64 = encode_pil_image(resized)
-    target = query_target_location(b64, instruction, model=args.gemini_model)
-    if target is None:
+    original_size = pil.size
+    api_img = resize_for_api(pil, max_size=1024)
+    api_size = api_img.size
+
+    detect = [args.manip_object, args.target_object]
+    object_locations = query_target_location(api_img, detect, model_name=args.gemini_model)
+    if not object_locations:
+        print("[mpc/plan] Gemini returned no object locations.")
         return None
-    traj = query_trajectory(b64, instruction, target, model=args.gpt_model)
-    if traj is None or len(traj) < 2:
+    manip_pt = object_locations.get(args.manip_object)
+    target_pt = object_locations.get(args.target_object)
+    if manip_pt is None:
+        print(f"[mpc/plan] Gemini could not locate manipulating object {args.manip_object!r}")
         return None
-    wp_api = np.asarray(traj, dtype=np.float32)
-    # resize_for_api shrinks to the API's preferred max dim; scale back to 1280x720.
-    wp = np.stack([wp_api[:, 0] * scale_x, wp_api[:, 1] * scale_y], axis=-1)
-    return wp.astype(np.float32)
+    if target_pt is None:
+        # Fall back: use instruction text for target via the GPT side.
+        target_pt = manip_pt
+
+    img_encoded = encode_pil_image(api_img)
+    trajectory = query_trajectory(
+        img=api_img,
+        img_encoded=img_encoded,
+        task=instruction,
+        manipulating_object=args.manip_object,
+        manipulating_object_point=manip_pt,
+        target_related_object=args.target_object,
+        target_related_object_point=target_pt,
+        target_location="",
+        gpt_model=args.gpt_model,
+        target_location_point=None,
+        full_task=instruction,
+    )
+    if not trajectory or "trajectory" not in trajectory:
+        print("[mpc/plan] GPT returned no trajectory.")
+        return None
+    # rescale to original image coords
+    trajectory = rescale_trajectory(trajectory, api_size, original_size)
+    pts = trajectory["trajectory"]
+    if not pts or len(pts) < 2:
+        return None
+    return np.asarray(pts, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +484,11 @@ def main(args: Args):
     mpc_device = None
     if args.guidance_mode == "mpc":
         mpc_device = _resolve_mpc_device(args.mpc_device)
+        # Reload extrinsics NOW using args.calibration_json — replaces the
+        # module-level _CACHED_EXTRINSIC set at import time (which did not see
+        # CLI overrides).
+        global _CACHED_EXTRINSIC
+        _CACHED_EXTRINSIC = _load_extrinsics(args.calibration_json)
         print(f"[mpc] device={mpc_device}  "
               f"weights(p={args.mpc_lam_p}, a={args.mpc_lam_a}, c={args.mpc_lam_c}, "
               f"s={args.mpc_lam_s}, prog={args.mpc_lam_prog})  "
@@ -405,6 +496,7 @@ def main(args: Args):
               f"std={args.mpc_init_std})  lookahead={args.mpc_arrow_lookahead}  "
               f"freeze_gripper={args.mpc_freeze_gripper}  "
               f"gripper_force_override={args.mpc_gripper_force_override}")
+        print(f"[mpc] extrinsic_cam_in_base = {_CACHED_EXTRINSIC.tolist()}")
 
     while True:
         instruction = input("\nEnter instruction (or 'q' to quit): ").strip()
