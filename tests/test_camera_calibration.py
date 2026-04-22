@@ -1,5 +1,27 @@
 """Camera-calibration sanity and visual-debug test.
 
+===========================================================================
+ QUICK-RUN (copy-paste) — on the robot laptop:
+---------------------------------------------------------------------------
+
+  # Live visual check (robot + ZED connected):
+  conda activate eva_jiani_env
+  cd ~/pi-trajectory-overlay
+  python tests/test_camera_calibration.py --live \
+      --left-camera-id 26368109 --right-camera-id 27085680 \
+      --wrist-camera-id 15512737 \
+      --out /tmp/cal_check_live.jpg
+
+  # Sanity-only (no robot needed, <1s):
+  python -m pytest tests/test_camera_calibration.py -v
+
+  # From a saved run dir (either box):
+  python tests/test_camera_calibration.py \
+      --run-dir ~/pi-trajectory-overlay/runs/<ts> \
+      --frame 0 --out /tmp/cal_check.jpg
+
+===========================================================================
+
 This file has two complementary jobs:
 
 1. **Pytest mode** — static/structural sanity checks on the repo-tracked
