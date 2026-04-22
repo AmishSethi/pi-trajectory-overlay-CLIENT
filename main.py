@@ -514,8 +514,62 @@ def _predict_trajectory(
     return trajectory
 
 
+def _stack_geometry_complete(planning: "PlanningState", step_data: dict) -> bool:
+    """Deterministic spatial heuristic for "stack X in/on Y" / "place X in/on Y"
+    / "put X in/on Y" steps.
+
+    Returns True when the most recent Gemini-ER detections show the manipulating
+    object with centroid directly above the target (small horizontal distance,
+    small positive vertical offset — "above" because image y=0 is the top).
+
+    This is an OR-supplement to Gemini's binary ``query_step_completion`` which
+    sometimes reports "not complete" even when the objects are clearly stacked
+    in the pixel plane (observed on red-in-green cup stacking: red ~10 px above
+    green, same x column, Gemini still said False).
+
+    Only fires for action verbs {stack, place, put}. Returns False otherwise.
+    """
+    step_text = (step_data.get("step") or "").lower()
+    if not any(kw in step_text for kw in ("stack", "place", "put")):
+        return False
+    manip = step_data.get("manipulating_object", "") or ""
+    target = step_data.get("target_related_object", "") or ""
+    if not (manip and target):
+        return False
+    locs = getattr(planning, "_last_object_locations", None) or {}
+
+    def _find(name: str):
+        if not name:
+            return None
+        if name in locs:
+            return locs[name]
+        name_l = name.lower()
+        for k, v in locs.items():
+            if name_l in k.lower():
+                return v
+        return None
+
+    mp = _find(manip)
+    tp = _find(target)
+    if mp is None or tp is None:
+        return False
+    dx = abs(float(mp[0]) - float(tp[0]))
+    dy = float(tp[1]) - float(mp[1])  # >0 => manip y is SMALLER => manip above target
+    # Loose-but-specific: same column (<40 px horiz), manip is 0–60 px above target.
+    return (dx < 40.0) and (0.0 < dy < 60.0)
+
+
 def _check_step_completion(planning: PlanningState, args: Args) -> bool:
-    """Check if current step is complete using Gemini."""
+    """Return True if the current step is complete.
+
+    Primary: ask Gemini (query_step_completion) "is this step complete?" on the
+    most recent frame. OR'd with a spatial heuristic
+    (:func:`_stack_geometry_complete`) that fires for stack/place/put steps
+    whenever the cached Gemini-ER detections show the manipulating object
+    directly above the target in pixels. The heuristic covers the case where
+    Gemini's textual "is it complete?" returns False even though the pixel
+    positions say the two objects are clearly stacked.
+    """
     if not planning.img_history:
         return False
 
@@ -529,7 +583,18 @@ def _check_step_completion(planning: PlanningState, args: Args) -> bool:
         model_name=args.gemini_model,
         max_images=1,
     )
-    return result.get("is_complete", False)
+    gemini_says = bool(result.get("is_complete", False))
+    heuristic_says = _stack_geometry_complete(planning, step_data)
+    if heuristic_says and not gemini_says:
+        mp = planning._last_object_locations.get(
+            step_data.get("manipulating_object", ""), None
+        )
+        tp = planning._last_object_locations.get(
+            step_data.get("target_related_object", ""), None
+        )
+        print(f"[step {planning.step_idx}] spatial heuristic → COMPLETE "
+              f"(manip={mp}, target={tp}; Gemini textual said False)")
+    return gemini_says or heuristic_says
 
 
 # ---------------------------------------------------------------------------
