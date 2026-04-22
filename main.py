@@ -38,6 +38,7 @@ import json
 import os
 import signal
 import time
+from typing import Literal
 
 import numpy as np
 from openpi_client import image_tools
@@ -96,6 +97,29 @@ class Args:
     # Output
     save_dir: str = "trajectory_overlay_runs"
     no_overlay: bool = False  # Disable trajectory overlay (for ablation)
+
+    # Guidance mode — selects how the predicted trajectory is fed to the policy.
+    # "off": no overlay, no guidance. "overlay": draw trajectory on image (legacy).
+    # "mpc": send trajectory as guidance data; server runs MPC (CEM) over the
+    # VLA's sampled action chunk with the arrow as a soft pixel-space target.
+    guidance_mode: Literal["off", "overlay", "mpc"] = "off"
+    guidance_control_hz: float = 15.0  # actual DROID control rate; control_dt = 1/hz
+
+    # MPC weight knobs (used in mpc mode only).
+    #   lam_p  — stay close to the VLA prior (action-space L2)
+    #   lam_a  — follow the arrow (masked L2 in 2D flipped-pixel space)
+    #   lam_c  — joint limits + action box fence (large → near-hard)
+    #   lam_s  — smoothness (finite-diff L2 along time)
+    mpc_lam_p: float = 1.0
+    mpc_lam_a: float = 1.0
+    mpc_lam_c: float = 100.0
+    mpc_lam_s: float = 0.01
+
+    # CEM hyperparameters (used in mpc mode only).
+    mpc_n_samples: int = 200
+    mpc_n_iterations: int = 4
+    mpc_n_elites: int = 20
+    mpc_init_std: float = 0.05
 
     # Visualization
     show_display: bool = True  # Show live OpenCV debug window
@@ -237,6 +261,93 @@ def _draw_trajectory_on_image(
     result = add_trace_overlay(image_rgb, pts, current_index=idx, config=config,
                                num_interpolated=100)
     return np.array(result.convert("RGB"))
+
+
+# ---------------------------------------------------------------------------
+# Guidance payload builder (used when --guidance-mode guide)
+# ---------------------------------------------------------------------------
+
+# HD720 factory intrinsics for ZED serial 26368109 LEFT.
+_GUIDANCE_K_INTRINSICS_26368109_LEFT = np.array(
+    [[532.66, 0.0, 641.305],
+     [0.0, 532.55, 347.186],
+     [0.0, 0.0, 1.0]],
+    dtype=np.float32,
+)
+
+# Fallback extrinsics (copied from calibration.json key "26368109_left") in case
+# the calibration file is missing at runtime.
+_GUIDANCE_EXTRINSIC_FALLBACK_26368109_LEFT = np.array(
+    [0.09153819431911293, -0.01455634604254126, 0.2287419968377015,
+     -1.5253417996893945, 0.019538164296171168, -1.55553965929186],
+    dtype=np.float32,
+)
+
+_CALIBRATION_JSON_PATH = "/home/asethi04/ROBOTICS/eva_pal_share/eva/utils/calibration.json"
+
+
+def _load_extrinsics_26368109_left() -> np.ndarray:
+    """Load cached 6-vec extrinsics for the external ZED (serial 26368109 left)."""
+    try:
+        with open(_CALIBRATION_JSON_PATH) as f:
+            calib = json.load(f)
+        ext = calib["26368109_left"]["extrinsics"]
+        return np.asarray(ext, dtype=np.float32)
+    except (OSError, KeyError, json.JSONDecodeError) as e:
+        print(f"[guidance] Could not read {_CALIBRATION_JSON_PATH} ({e!r}); using hard-coded fallback extrinsics.")
+        return _GUIDANCE_EXTRINSIC_FALLBACK_26368109_LEFT.copy()
+
+
+# Franka Panda joint velocity limits (rad/s), from the official FCI datasheet.
+# TODO(calibrate): placeholder — needs empirical calibration against a recorded
+# rollout so that guidance-driven joint velocity scaling is consistent with the
+# policy's effective action magnitude.
+_GUIDANCE_JOINT_VEL_SCALE = np.array(
+    [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61],
+    dtype=np.float32,
+)
+
+
+def _build_guidance_payload(
+    args: Args,
+    curr_obs: dict,
+    traj_points_px: list,
+    ext_image_hw: tuple,
+) -> dict:
+    """Build the ``guidance/*`` sub-dict the policy server consumes in mpc mode.
+
+    ``traj_points_px`` is already in the flipped 1280x720 frame (because
+    ``_extract_observation`` already flipped the image and GPT planned on that
+    flipped image), so it is passed straight through.
+    """
+    # curr_obs is accepted for future use (e.g. attaching the current joint
+    # state for the server's sampler); not needed by the current schema.
+    del curr_obs
+
+    return {
+        "guidance/waypoints_px": np.asarray(traj_points_px, dtype=np.float32),
+        "guidance/image_hw": np.asarray([ext_image_hw[0], ext_image_hw[1]], dtype=np.int32),
+        "guidance/K_intrinsics": _GUIDANCE_K_INTRINSICS_26368109_LEFT.copy(),
+        "guidance/extrinsic_cam_in_base": _CACHED_EXTRINSIC_26368109_LEFT.copy(),
+        "guidance/image_flipped_180": True,
+        "guidance/control_dt": float(1.0 / args.guidance_control_hz),
+        "guidance/joint_vel_scale": _GUIDANCE_JOINT_VEL_SCALE.copy(),
+        # MPC weights
+        "guidance/lam_p": float(args.mpc_lam_p),
+        "guidance/lam_a": float(args.mpc_lam_a),
+        "guidance/lam_c": float(args.mpc_lam_c),
+        "guidance/lam_s": float(args.mpc_lam_s),
+        # CEM hyperparameters
+        "guidance/cem_n_samples": int(args.mpc_n_samples),
+        "guidance/cem_n_iterations": int(args.mpc_n_iterations),
+        "guidance/cem_n_elites": int(args.mpc_n_elites),
+        "guidance/cem_init_std": float(args.mpc_init_std),
+    }
+
+
+# Load the extrinsics once at import time and cache. If the calibration file is
+# absent we fall back to the hard-coded copy.
+_CACHED_EXTRINSIC_26368109_LEFT = _load_extrinsics_26368109_left()
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +540,14 @@ def main(args: Args):
     assert args.external_camera in ("left", "right"), (
         f"--external-camera must be 'left' or 'right', got {args.external_camera}"
     )
+
+    # Backwards compat: --no-overlay still works and is equivalent to
+    # --guidance-mode off (unless the caller explicitly picked a non-default
+    # guidance mode, in which case we honor that and leave no_overlay alone).
+    if args.no_overlay and args.guidance_mode == "overlay":
+        print("[guidance] --no-overlay given; forcing --guidance-mode off")
+        args.guidance_mode = "off"
+    print(f"[guidance] mode={args.guidance_mode}")
 
     # Import DROID env
     from droid.robot_env import RobotEnv
@@ -714,7 +833,7 @@ def main(args: Args):
                 # a new plan arrives (whose waypoint 0 is the freshly-detected
                 # object location).
                 annotated_ext_image = ext_image.copy()
-                if not args.no_overlay and planning.pred_traj is not None:
+                if args.guidance_mode == "overlay" and planning.pred_traj is not None:
                     traj_pts = planning.pred_traj.get("trajectory", [])
                     if len(traj_pts) >= 2:
                         annotated_ext_image = _draw_trajectory_on_image(
@@ -761,6 +880,23 @@ def main(args: Args):
                         "observation/gripper_position": curr_obs["gripper_position"],
                         "prompt": current_instruction,
                     }
+
+                    # In mpc mode, attach the trajectory as raw guidance data
+                    # (not drawn on the image). The server strips the
+                    # "guidance/" keys, samples the VLA as usual, then runs
+                    # CEM-based MPC over the action chunk with the waypoints as
+                    # a soft 2D-pixel target. In "off" / "overlay" modes the
+                    # request is unchanged, so server behavior matches today's.
+                    if args.guidance_mode == "mpc" and planning.pred_traj is not None:
+                        traj_pts_px = planning.pred_traj.get("trajectory", [])
+                        if len(traj_pts_px) >= 2:
+                            guidance_payload = _build_guidance_payload(
+                                args,
+                                curr_obs,
+                                traj_pts_px,
+                                ext_image_hw=ext_image.shape[:2],
+                            )
+                            request_data.update(guidance_payload)
 
                     inference_start = time.time()
                     with prevent_keyboard_interrupt():

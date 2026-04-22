@@ -35,5 +35,11 @@ tqdm>=4.66
 # Run loop utilities
 moviepy==1.0.3
 
+# Optional: torch is required ONLY for main_mpc.py with --guidance-mode=mpc
+# (the client-side CEM refinement uses torch tensors). main_mpc.py --guidance-mode=off,
+# main_pi05.py, and main.py do not need torch. CPU-only install for a laptop:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torch>=2.1
+
 # Tests
 pytest>=8.0

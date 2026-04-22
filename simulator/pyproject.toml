@@ -11,6 +11,12 @@ dependencies = [
     "imageio[pyav]",
     "av<16",
 ]
+# NOTE: LLM trajectory planning deps (openai, google-genai) are INCOMPATIBLE
+# with isaacsim 5.0.0 because google-genai >= 0.3 requires websockets >= 13
+# while isaacsim pins websockets == 12. When --guidance-mode=mpc is used
+# WITHOUT --canned-waypoints-json, the LLM planner must run in a separate
+# venv + subprocess (see simulator/llm_planner_venv/). Direct import into
+# main_robolab.py won't work.
 
 [tool.uv]
 prerelease = "allow"

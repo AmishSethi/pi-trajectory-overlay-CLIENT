@@ -8,6 +8,12 @@ example_outputs/
 # Per-rollout output directories (videos, frames, planning reports, actions.log)
 runs/
 runs_pi05/
+runs_mpc/
 runs_robolab/
+runs_sweep_*/
+runs_mpc_*/
 simulator/runs/
 simulator/runs_robolab/
+
+# LLM planner subprocess env lives outside the main venv and has its own git.
+google-gen-ai-env/
