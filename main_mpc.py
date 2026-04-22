@@ -667,6 +667,38 @@ def main(args: Args):
             except ImportError:
                 print("moviepy not installed, skipping video save")
 
+        # Auto-render MPC-annotated video (arrow + yellow EE dot + replan flash)
+        # using the same FK post-hoc annotator that the simulator uses. Runs
+        # only when MPC was on AND we have both rollout.mp4 and at least one
+        # waypoint file. Failures here don't kill the rollout — the raw video +
+        # waypoints + q-log are always preserved so annotation can be re-run
+        # manually later via tools/annotate_fk.py.
+        if args.guidance_mode == "mpc":
+            rollout_mp4 = os.path.join(run_dir, "rollout.mp4")
+            annotator = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "tools", "annotate_fk.py")
+            have_wp = bool([x for x in os.listdir(run_dir)
+                            if x.startswith("mpc_waypoints") and x.endswith(".json")])
+            if os.path.exists(rollout_mp4) and have_wp and os.path.exists(annotator):
+                out_path = os.path.join(run_dir, "rollout_annotated.mp4")
+                label = f"main_mpc la={args.mpc_lam_a} lp={args.mpc_lam_p} " \
+                        f"prog={args.mpc_lam_prog} lookahead={args.mpc_arrow_lookahead}"
+                import subprocess
+                print("[mpc/viz] rendering annotated rollout ...")
+                try:
+                    subprocess.run(
+                        [sys.executable, annotator,
+                         "--run-dir", run_dir,
+                         "--out", out_path,
+                         "--label", label],
+                        check=True, timeout=300,
+                    )
+                    print(f"[mpc/viz] -> {out_path}")
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    print(f"[mpc/viz] annotation failed: {e!r}. Raw artifacts kept; "
+                          f"re-run manually: python tools/annotate_fk.py "
+                          f"--run-dir {run_dir} --out {out_path}")
+
         success = input("Did the rollout succeed? (y/n): ").strip().lower()
         with open(os.path.join(run_dir, "result.txt"), "w") as f:
             f.write(f"success: {success}\n")
