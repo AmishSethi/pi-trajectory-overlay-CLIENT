@@ -177,9 +177,24 @@ def annotate(run_dir: str, out_path: str, task_label: str) -> None:
     q_list = parse_actions_log(log)
     snapshot = load_spec_snapshot(snap_path) if os.path.exists(snap_path) else None
     windows = load_waypoint_windows(run_dir)
-    baseline_mode = not windows or snapshot is None or not q_list
-    if baseline_mode:
-        print(f"  [baseline mode] no waypoints/snapshot/q-log — will write HUD-only overlay")
+    # Three independent capabilities — we can do partial annotation when
+    # some are missing. This lets the annotator serve both as an
+    # MPC-rollout viz AND as a whole-video calibration checker on baseline
+    # (no-MPC) runs that still have q_t logged and a calibration snapshot.
+    has_fk = bool(q_list) and snapshot is not None
+    has_arrow = bool(windows)
+    if has_fk and has_arrow:
+        mode_tag = "[MPC]"
+    elif has_fk:
+        mode_tag = "[FK-only]"    # draw EE dot only, no arrow
+    else:
+        mode_tag = "[baseline]"   # no EE, no arrow — HUD + grip flash only
+    if not has_fk:
+        print(f"  [annotate] no FK data (q-log or spec snapshot missing); "
+              f"will write HUD-only overlay")
+    elif not has_arrow:
+        print(f"  [annotate] no MPC waypoints in run dir; drawing EE dot each "
+              f"frame for calibration verification, no arrow overlay")
 
     cap = cv2.VideoCapture(video)
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -213,17 +228,21 @@ def annotate(run_dir: str, out_path: str, task_label: str) -> None:
     for t, ev in grip_events:
         grip_flash[t] = ev
 
+    # Dummy 2-point waypoint used to build a GuidanceSpec when the run has
+    # FK data but no MPC waypoints. The spec's waypoints_px field doesn't
+    # affect ee_pixel_at_q0 — only q0/K/ext/jvs/flange-offset matter for it.
+    _DUMMY_WP = np.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+
     for t in range(n_frames):
         ok, frame = cap.read()
         if not ok:
             break
-        w = active_window(windows, t) if not baseline_mode else None
-        q_t = q_list[t] if (not baseline_mode and t < len(q_list)) else None
+        w = active_window(windows, t) if has_arrow else None
+        q_t = q_list[t] if (has_fk and t < len(q_list)) else None
         if w is not None and w.t_step != last_plan_t:
             last_plan_t = w.t_step
             flash = 8
         out = frame
-        mode_tag = "[baseline]" if baseline_mode else "[MPC]"
         hud = [(f"{mode_tag} {task_label}  step {t}/{n_frames - 1}", (255, 255, 255))]
         cur_g = grip_by_t.get(t, None)
         if cur_g is not None:
@@ -239,50 +258,59 @@ def annotate(run_dir: str, out_path: str, task_label: str) -> None:
                 break
         if ev_recent is not None:
             ev, age = ev_recent
-            alpha = 1.0 - age / 8.0
             col = (0, 255, 255) if ev == "CLOSE" else (255, 200, 0)
             cv2.putText(out, f"** GRIP {ev} **", (int(W*0.35), 40), cv2.FONT_HERSHEY_SIMPLEX,
                         1.0, (0, 0, 0), 5, cv2.LINE_AA)
             cv2.putText(out, f"** GRIP {ev} **", (int(W*0.35), 40), cv2.FONT_HERSHEY_SIMPLEX,
                         1.0, col, 2, cv2.LINE_AA)
+
+        # Arrow overlay (requires waypoints for this frame).
         if w is not None:
             out = draw_arrow(out, w.waypoints)
             hud.append((f"arrow plan #{windows.index(w) + 1}  (t_plan={w.t_step})",
                         (0, 255, 255)))
-            # Compute the ACTUAL EE pixel at this step's logged joint state.
-            if q_t is not None and q_t.shape[0] >= 7:
-                spec = make_spec(snapshot, q_t, w.waypoints)
-                with torch.no_grad():
-                    ee_px = ee_pixel_at_q0(spec).cpu().numpy()
-                # Draw the projection cross FIRST so the yellow EE dot ends up on top.
+
+        # EE dot (requires FK data — q_t + snapshot). Drawn whether or not we
+        # also have waypoints, so the annotator doubles as a whole-video
+        # calibration checker on baseline runs.
+        if has_fk and q_t is not None and q_t.shape[0] >= 7:
+            wp_for_spec = w.waypoints if w is not None else _DUMMY_WP
+            spec = make_spec(snapshot, q_t, wp_for_spec)
+            with torch.no_grad():
+                ee_px = ee_pixel_at_q0(spec).cpu().numpy()
+            # If we also have waypoints, draw projection cross + dashed
+            # off-arrow line FIRST so the yellow EE dot ends up on top.
+            if w is not None:
                 wp_t = torch.tensor(w.waypoints, dtype=torch.float32)
                 cum, total = _cumulative_arc_length(wp_t)
                 s_frac = 0.0
                 if float(total) > 0.0:
-                    ee_t = torch.tensor(ee_px, dtype=torch.float32)
-                    s0 = _project_ee_to_arc(ee_t, wp_t, cum, total)
+                    ee_tensor = torch.tensor(ee_px, dtype=torch.float32)
+                    s0 = _project_ee_to_arc(ee_tensor, wp_t, cum, total)
                     s_frac = float(s0 / total)
                     seg = wp_t[1:] - wp_t[:-1]
                     seg_len = torch.linalg.vector_norm(seg, dim=-1)
                     cumlen = torch.cat([torch.zeros(1), torch.cumsum(seg_len, dim=0)])
-                    idx = int(torch.searchsorted(cumlen, s0, right=False).clamp(min=1, max=wp_t.shape[0] - 1).item())
+                    idx = int(torch.searchsorted(cumlen, s0, right=False).clamp(
+                        min=1, max=wp_t.shape[0] - 1).item())
                     s_before = float(cumlen[idx - 1])
                     span = float(cumlen[idx] - cumlen[idx - 1])
                     alpha = 0.0 if span < 1e-9 else float((s0 - s_before) / span)
                     alpha = max(0.0, min(1.0, alpha))
                     proj_px = wp_t[idx - 1] + alpha * (wp_t[idx] - wp_t[idx - 1])
                     draw_arrow_proj(out, (float(proj_px[0]), float(proj_px[1])))
-                    # Also draw a thin blue dashed line between the actual EE and
-                    # its arrow projection so it is obvious when the gripper is
-                    # OFF the arrow vs ON it.
                     p1 = (int(round(float(ee_px[0]))), int(round(float(ee_px[1]))))
                     p2 = (int(round(float(proj_px[0]))), int(round(float(proj_px[1]))))
                     cv2.line(out, p1, p2, (0, 0, 0), thickness=3, lineType=cv2.LINE_AA)
                     cv2.line(out, p1, p2, (255, 200, 0), thickness=1, lineType=cv2.LINE_AA)
-                # Draw the yellow EE dot LAST, so it overlays the cross when they coincide.
-                draw_ee_dot(out, (float(ee_px[0]), float(ee_px[1])))
-                hud.append((f"s0 = {s_frac * 100:.1f}% of arrow", (255, 128, 0)))
-                hud.append(("yellow=EE(actual)  blue+=projection", (255, 255, 255)))
+                    hud.append((f"s0 = {s_frac * 100:.1f}% of arrow", (255, 128, 0)))
+                    hud.append(("yellow=EE(actual)  blue+=projection", (255, 255, 255)))
+            else:
+                # Calibration-check mode: annotate what the dot MEANS since
+                # there's no arrow context to infer it from.
+                hud.append((f"yellow=EE(FK) @ ({ee_px[0]:.0f},{ee_px[1]:.0f})  "
+                            f"— should sit on the real gripper", (0, 255, 255)))
+            draw_ee_dot(out, (float(ee_px[0]), float(ee_px[1])))
         if flash > 0:
             cv2.rectangle(out, (0, 0), (W - 1, H - 1), (0, 255, 255), thickness=4)
             cv2.putText(out, "** RE-PLAN **", (W - 240, 35), cv2.FONT_HERSHEY_SIMPLEX,
