@@ -103,7 +103,7 @@ K_REAL = np.array(
     dtype=np.float32,
 )
 IMG_H, IMG_W = 720, 1280
-EE_OFFSET_FROM_FLANGE = 0.0     # real-robot uses flange (panda_link8)
+EE_OFFSET_FROM_FLANGE = 0.1034  # Franka panda_hand_tcp — matches sim adapter
 AXIS_LEN_M = 0.10                # EE coord-frame arrow length in base-frame metres
 
 
@@ -408,7 +408,7 @@ def _run_visual(args):
     # Project kinematic chain + EE + axes
     origins, R_flange = fk_all_joint_origins(q, flange_offset=EE_OFFSET_FROM_FLANGE)
     joint_pixels = project_base_to_pixel(origins, ext_vec, K_REAL,
-                                          image_hw=(IMG_H, IMG_W), flipped_180=True)
+                                          image_hw=(IMG_H, IMG_W), flipped_180=False)
     ee_pos_base = origins[-1]
     # Axes tips in base frame: origin + 0.1 * each flange-frame axis
     axis_tips_base = np.stack([
@@ -417,7 +417,7 @@ def _run_visual(args):
         ee_pos_base + AXIS_LEN_M * R_flange[:, 2],
     ], axis=0)
     axis_tips_pix = project_base_to_pixel(axis_tips_base, ext_vec, K_REAL,
-                                          image_hw=(IMG_H, IMG_W), flipped_180=True)
+                                          image_hw=(IMG_H, IMG_W), flipped_180=False)
 
     ee_pix = joint_pixels[-1]
     in_bounds = bool(np.all(np.isfinite(ee_pix)) and

@@ -65,10 +65,13 @@ DROID_CONTROL_FREQUENCY = 15
 #   - HD720 factory intrinsics for ZED serial 26368109 LEFT
 #   - Extrinsics loaded from /home/asethi04/ROBOTICS/eva_pal_share/eva/utils/calibration.json
 #     with a hard-coded fallback that matches the repo's calibration snapshot.
-#   - image_flipped_180 = True because externals are mounted upside-down on this rig.
-#   - ee_offset_from_flange = 0.0 — real-robot FK matches the existing
-#     trajectory_cost tests (flange), unlike the sim which adds the 0.1034 m
-#     panda_hand_tcp offset.
+#   - image_flipped_180 = False: the DROID Charuco calibration produces extrinsics
+#     that project directly into the displayed (post-[::-1,::-1]) frame, so the
+#     projection must NOT apply an additional 180° flip. Verified live on
+#     2026-04-23: with flipped_180=False the projected EE lands on the visible
+#     gripper; with True it lands on the mirrored pixel (~600 px off).
+#   - ee_offset_from_flange = 0.1034 m — Franka panda_hand_tcp (URDF standard).
+#     Matches the sim adapter. Projects onto the gripper body / grasp center.
 # ---------------------------------------------------------------------------
 _REAL_K_INTRINSICS = np.array(
     [[532.66, 0.0, 641.305],
@@ -104,7 +107,19 @@ _REAL_JOINT_VEL_SCALE = np.array(
 _REAL_IMAGE_HW = (720, 1280)
 
 # Real robot uses flange FK (matches ZED calibration).
-_REAL_EE_OFFSET_FROM_FLANGE = 0.0
+_REAL_EE_OFFSET_FROM_FLANGE = 0.1034
+
+# Empirical per-session correction added to the loaded extrinsic's translation
+# part (first 3 components). The 2026-04-23 DROID Charuco calibration had
+# ~120 px residual offset between projected and visible EE at home pose; we
+# computed the Δt_cb that maps the FK-predicted EE at q=home to pixel (790,
+# 430) — visually on the gripper wrist/flange. Formula:
+#   Δp_cam = z_cam · K^{-1} · [Δu, Δv, 0]   with Δu=-121.7, Δv=+53.7
+#   Δt_cb  = -R_cb · Δp_cam
+# See tools/apply_correction.py for the derivation.
+_EXTRINSIC_TRANSLATION_CORRECTION = np.array(
+    [-0.0845, -0.1270, 0.0609], dtype=np.float32,
+)
 
 
 def _load_extrinsics(override_path: str = "", camera_key: str = "26368109_left") -> np.ndarray:
@@ -142,8 +157,11 @@ def _load_extrinsics(override_path: str = "", camera_key: str = "26368109_left")
         ts = entry.get("timestamp", 0)
         import datetime as _dt
         iso = _dt.datetime.fromtimestamp(ts).isoformat() if ts else "no-ts"
-        print(f"[mpc] loaded {camera_key} extrinsics from {p} (calibrated {iso})")
-        return np.asarray(vec, dtype=np.float32)
+        ext = np.asarray(vec, dtype=np.float32)
+        ext[:3] += _EXTRINSIC_TRANSLATION_CORRECTION
+        print(f"[mpc] loaded {camera_key} extrinsics from {p} (calibrated {iso})"
+              f" + manual Δt={_EXTRINSIC_TRANSLATION_CORRECTION.tolist()}")
+        return ext
     raise FileNotFoundError(
         f"No usable calibration found for {camera_key}. Tried: {tried}. "
         f"Commit a fresh calibration_info.json to the repo's calibration/ "
@@ -328,7 +346,7 @@ def _save_spec_snapshot(run_dir: str) -> None:
             "joint_vel_scale": _REAL_JOINT_VEL_SCALE.tolist(),
             "image_hw": list(_REAL_IMAGE_HW),
             "control_dt": 1.0 / DROID_CONTROL_FREQUENCY,
-            "image_flipped_180": True,
+            "image_flipped_180": False,
             "ee_offset_from_flange": _REAL_EE_OFFSET_FROM_FLANGE,
         }, f, indent=2)
 
@@ -360,7 +378,7 @@ def _refine_chunk_with_mpc(
         image_hw=_REAL_IMAGE_HW,
         K_intrinsics=K,
         extrinsic_cam_in_base=ext,
-        image_flipped_180=True,
+        image_flipped_180=False,
         control_dt=1.0 / DROID_CONTROL_FREQUENCY,
         joint_vel_scale=jvs,
         q0=q0,
