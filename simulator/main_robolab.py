@@ -147,6 +147,20 @@ class Args:
     # timing via the gripper-reward term. Default True = legacy behaviour
     # (gripper frozen to the VLA's original choice).
     mpc_freeze_gripper: bool = True
+    # --- Policy-blending arbitration (Dragan-Srinivasa) -------------------
+    # When > 0, enables an EE-to-closer-endpoint distance check each cost
+    # call that scales lam_a / lam_prog by alpha in [0, 1] and adds
+    # (1-alpha)*mpc_prior_boost_near_waypoint to lam_p. Hands over control
+    # to the VLA's semantic priors near grasp/release. 0 = legacy behaviour.
+    mpc_arbitration_d_grasp_px: float = 0.0
+    mpc_arbitration_tau_px: float = 15.0
+    mpc_prior_boost_near_waypoint: float = 0.0
+    # --- Trust-region projection on CEM samples ---------------------------
+    # When > 0, every CEM sample is projected into an L2 ball of this
+    # radius around the VLA prior. Hard cap on how far the refined chunk
+    # can drift from a_vla, irrespective of how aggressive the arrow
+    # weights become. 0 = legacy behaviour.
+    mpc_trust_region_radius: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +350,9 @@ def _make_mpc_runtime(args: "Args"):
         lam_c=float(args.mpc_lam_c),
         lam_s=float(args.mpc_lam_s),
         lam_prog=float(args.mpc_lam_prog),
+        arbitration_d_grasp_px=float(args.mpc_arbitration_d_grasp_px),
+        arbitration_tau_px=float(args.mpc_arbitration_tau_px),
+        prior_boost_near_waypoint=float(args.mpc_prior_boost_near_waypoint),
     )
     cem_params = CEMParams(
         n_samples=int(args.mpc_n_samples),
@@ -343,6 +360,7 @@ def _make_mpc_runtime(args: "Args"):
         n_elites=int(args.mpc_n_elites),
         init_std=float(args.mpc_init_std),
         freeze_gripper=bool(args.mpc_freeze_gripper),
+        trust_region_radius=float(args.mpc_trust_region_radius),
     )
     return weights, cem_params
 
@@ -819,6 +837,22 @@ if __name__ == "__main__":
         "--mpc-unfreeze-gripper", "--mpc_unfreeze_gripper", action="store_true", default=False,
         help="Let CEM sample the gripper dimension (default: frozen to VLA value). Paired with --mpc-gripper-reward-weight, the CEM can learn grip timing.",
     )
+    parser.add_argument(
+        "--mpc-arbitration-d-grasp-px", "--mpc_arbitration_d_grasp_px", type=float, default=0.0,
+        help="Policy-blending: when EE pixel is within this distance of the closer arrow endpoint, scale lam_a/lam_prog by alpha=sigmoid((d - this)/tau). 0 = off.",
+    )
+    parser.add_argument(
+        "--mpc-arbitration-tau-px", "--mpc_arbitration_tau_px", type=float, default=15.0,
+        help="Sharpness of the alpha-arbitration sigmoid. Smaller = sharper transition near d_grasp.",
+    )
+    parser.add_argument(
+        "--mpc-prior-boost-near-waypoint", "--mpc_prior_boost_near_waypoint", type=float, default=0.0,
+        help="Additive boost to lam_p when alpha→0 (EE near a critical waypoint). 0 = no boost.",
+    )
+    parser.add_argument(
+        "--mpc-trust-region-radius", "--mpc_trust_region_radius", type=float, default=0.0,
+        help="Hard L2 cap on how far a CEM sample may deviate from a_vla. 0 = off.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     ns, _ = parser.parse_known_args()
     ns.enable_cameras = True
@@ -859,6 +893,10 @@ if __name__ == "__main__":
             mpc_gripper_force_override=ns.mpc_gripper_force_override,
             mpc_lam_prog=ns.mpc_lam_prog,
             mpc_freeze_gripper=(not ns.mpc_unfreeze_gripper),
+            mpc_arbitration_d_grasp_px=ns.mpc_arbitration_d_grasp_px,
+            mpc_arbitration_tau_px=ns.mpc_arbitration_tau_px,
+            mpc_prior_boost_near_waypoint=ns.mpc_prior_boost_near_waypoint,
+            mpc_trust_region_radius=ns.mpc_trust_region_radius,
         ))
     finally:
         _SIM_APP.close()

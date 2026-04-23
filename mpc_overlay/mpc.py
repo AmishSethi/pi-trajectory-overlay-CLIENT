@@ -39,6 +39,29 @@ class MPCWeights:
     # a scalar in units of pixels of arrow arc length. 0 = disabled.
     lam_prog: float = 0.0
 
+    # --- Policy-blending arbitration (Dragan & Srinivasa 2013) ------------
+    # When ``arbitration_d_grasp_px > 0``, a scalar confidence alpha in
+    # [0, 1] is computed per cost call as
+    #     alpha = sigmoid((d_crit - arbitration_d_grasp_px) / arbitration_tau_px)
+    # where d_crit = min(|ee_now - first_wp|, |ee_now - last_wp|) — the EE's
+    # pixel distance to the arrow's pickup or drop endpoint, whichever is
+    # closer. alpha→0 "near a critical contact point" (trust the VLA),
+    # alpha→1 far from one (trust the MPC arrow).
+    #
+    # Effective cost inside the cost_fn becomes:
+    #     lam_a_eff    = alpha * lam_a
+    #     lam_prog_eff = alpha * lam_prog
+    #     lam_p_eff    = lam_p + (1 - alpha) * prior_boost_near_waypoint
+    #
+    # This is the classic "timid-blending" alpha-arbitration used in
+    # shared-autonomy literature, adapted for the VLA-MPC setting. When
+    # arbitration_d_grasp_px == 0 (default) arbitration is disabled and
+    # cost is computed with the raw weights above — identical to pre-
+    # arbitration behaviour.
+    arbitration_d_grasp_px: float = 0.0
+    arbitration_tau_px: float = 15.0
+    prior_boost_near_waypoint: float = 0.0
+
 
 @dataclasses.dataclass
 class CEMParams:
@@ -50,6 +73,15 @@ class CEMParams:
     freeze_gripper: bool = True
     clip_action: bool = True
     seed: int | None = None
+
+    # --- Trust-region projection (TRPO / residual-MPPI pattern) -----------
+    # When > 0, every CEM sample is projected into a ball of L2 radius
+    # ``trust_region_radius`` around the VLA prior after adding noise and
+    # applying the standard action-box clip. This guarantees no candidate
+    # drifts further from a_vla than the semantic radius, independent of
+    # how aggressive the arrow / progress weights become. 0 = disabled
+    # (legacy behaviour).
+    trust_region_radius: float = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -277,30 +309,73 @@ def gripper_action_reward(candidates: Tensor, spec: GuidanceSpec) -> Tensor:
 # --------------------------------------------------------------------------- #
 # Composite cost + CEM
 # --------------------------------------------------------------------------- #
+def compute_arbitration_alpha(spec: GuidanceSpec, weights: MPCWeights,
+                               device, dtype) -> float:
+    """Dragan-style timid-blending alpha in [0, 1] based on EE pixel distance
+    to the closer of the arrow's two endpoints. alpha→0 near a critical
+    contact point (arrow pickup or drop), alpha→1 elsewhere.
+
+    Returns 1.0 (no arbitration) when arbitration_d_grasp_px <= 0 or the
+    arrow is degenerate. Cheap: one EE projection + two norms per cost call.
+    """
+    d_crit = float(weights.arbitration_d_grasp_px)
+    if d_crit <= 0.0:
+        return 1.0
+    waypoints = spec.waypoints_px.detach().to(device=device, dtype=dtype)
+    if waypoints.shape[0] < 2:
+        return 1.0
+    from mpc_overlay.trajectory_cost import ee_pixel_at_q0
+    spec_current = dataclasses.replace(
+        spec, q0=spec.q0.to(device=device, dtype=dtype)[:1]
+    )
+    ee_now = ee_pixel_at_q0(spec_current, device=device, dtype=dtype)
+    d_start = torch.linalg.vector_norm(ee_now - waypoints[0])
+    d_end = torch.linalg.vector_norm(ee_now - waypoints[-1])
+    d_min = torch.minimum(d_start, d_end)
+    tau = max(float(weights.arbitration_tau_px), 1e-3)
+    alpha = torch.sigmoid((d_min - d_crit) / tau)
+    return float(alpha.item())
+
+
 def build_mpc_cost(
     a_vla: Tensor,                      # (T, D)
     spec: GuidanceSpec,                 # spec.q0 is (1, 7)
     weights: MPCWeights,
 ) -> Callable[[Tensor], Tensor]:
-    """Factory that returns cost_fn: (N, T, D) -> (N,)."""
+    """Factory that returns cost_fn: (N, T, D) -> (N,).
+
+    When ``weights.arbitration_d_grasp_px > 0``, a scalar alpha in [0, 1] is
+    computed ONCE per cost call (shared across all N candidates) from the
+    current EE's pixel distance to the closer arrow endpoint; alpha then
+    scales the arrow and progress terms, and (1 - alpha) adds
+    ``prior_boost_near_waypoint`` to the prior term. This is the
+    arbitration recipe from the shared-autonomy literature (Dragan 2013,
+    VLA-Pilot 2025) adapted to our CEM composite cost.
+    """
 
     def cost_fn(candidates: Tensor) -> Tensor:
         jvs = spec.joint_vel_scale
         q0 = spec.q0
+        alpha = compute_arbitration_alpha(spec, weights,
+                                           device=candidates.device,
+                                           dtype=candidates.dtype)
+        lam_p_eff = weights.lam_p + (1.0 - alpha) * float(weights.prior_boost_near_waypoint)
+        lam_a_eff = alpha * weights.lam_a
+        lam_prog_eff = alpha * weights.lam_prog
         terms = []
-        if weights.lam_p != 0.0:
-            terms.append(weights.lam_p * prior_penalty(candidates, a_vla))
-        if weights.lam_a != 0.0:
-            terms.append(weights.lam_a * arrow_penalty(candidates, spec))
+        if lam_p_eff != 0.0:
+            terms.append(lam_p_eff * prior_penalty(candidates, a_vla))
+        if lam_a_eff != 0.0:
+            terms.append(lam_a_eff * arrow_penalty(candidates, spec))
         if weights.lam_c != 0.0:
             jl = joint_limit_penalty(candidates, q0, jvs, spec.control_dt)
             ab = action_box_penalty(candidates)
             terms.append(weights.lam_c * (jl + ab))
         if weights.lam_s != 0.0:
             terms.append(weights.lam_s * smoothness_penalty(candidates))
-        if weights.lam_prog != 0.0:
+        if lam_prog_eff != 0.0:
             # Reward (sign-flipped: subtract so a bigger s_end - s_start lowers cost).
-            terms.append(-weights.lam_prog * arrow_progress_reward(candidates, spec))
+            terms.append(-lam_prog_eff * arrow_progress_reward(candidates, spec))
         # Gripper reward (sign-flipped: it's a REWARD, so subtract from cost).
         # Only active when spec.gripper_reward_weight > 0 AND freeze_gripper=False in CEM
         # (the weight is a spec field, but the gripper dim only varies if CEM is
@@ -344,6 +419,10 @@ def cem_optimize(
         best_cost = init_cost.item()
         best_chunk = mu.detach().clone()
 
+    # Cache a_vla on device for the trust-region projection (reused every iter).
+    a_vla_for_tr = init_mean.to(device)
+    tr_radius = float(params.trust_region_radius)
+
     for _ in range(params.n_iterations):
         eps = torch.randn(
             (params.n_samples, *mu.shape),
@@ -354,6 +433,15 @@ def cem_optimize(
         C = mu.unsqueeze(0) + eps * sigma.unsqueeze(0)          # (N, T, D)
         if params.freeze_gripper and D > 7:
             C[:, :, 7] = init_mean[:, 7].to(device).unsqueeze(0)
+        if tr_radius > 0.0:
+            # Project each candidate into the L2 ball of radius tr_radius
+            # around a_vla. "delta" is (N, T, D); flattening over (T, D)
+            # gives per-sample norms. Samples inside the ball are untouched;
+            # samples outside get shrunk back to the boundary.
+            delta = C - a_vla_for_tr.unsqueeze(0)
+            norm = delta.pow(2).sum(dim=(-2, -1)).sqrt().clamp(min=1e-12)
+            scale = (tr_radius / norm).clamp(max=1.0).unsqueeze(-1).unsqueeze(-1)
+            C = a_vla_for_tr.unsqueeze(0) + delta * scale
         if params.clip_action:
             C = C.clamp(-1.0, 1.0)
 
@@ -377,6 +465,12 @@ def cem_optimize(
         mu_cand = mu.clone()
         if params.freeze_gripper and D > 7:
             mu_cand[:, 7] = init_mean[:, 7].to(device)
+        if tr_radius > 0.0:
+            # Same TR projection on the re-evaluation candidate.
+            delta = mu_cand - a_vla_for_tr
+            norm = delta.pow(2).sum().sqrt().clamp(min=1e-12)
+            if norm.item() > tr_radius:
+                mu_cand = a_vla_for_tr + delta * (tr_radius / norm)
         if params.clip_action:
             mu_cand = mu_cand.clamp(-1.0, 1.0)
         mu_cost = cost_fn(mu_cand.unsqueeze(0))[0]
