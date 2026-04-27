@@ -120,6 +120,7 @@ def build_sim_guidance_spec(
     gripper_reward_weight: float = 0.0,
     gripper_zone_frac: float = 0.15,
     gripper_force_override: bool = False,
+    gripper_state_now: float | None = None,
 ) -> GuidanceSpec:
     """Assemble a ``GuidanceSpec`` ready to pass to ``mpc_overlay(...)``.
 
@@ -165,4 +166,5 @@ def build_sim_guidance_spec(
         gripper_reward_weight=float(gripper_reward_weight),
         gripper_zone_frac=float(gripper_zone_frac),
         gripper_force_override=bool(gripper_force_override),
+        gripper_state_now=(None if gripper_state_now is None else float(gripper_state_now)),
     )

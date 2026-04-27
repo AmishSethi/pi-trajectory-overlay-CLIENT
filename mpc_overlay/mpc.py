@@ -61,6 +61,16 @@ class MPCWeights:
     arbitration_d_grasp_px: float = 0.0
     arbitration_tau_px: float = 15.0
     prior_boost_near_waypoint: float = 0.0
+    # Gripper-state-aware arbitration: when enabled (> 0) and
+    # GuidanceSpec.gripper_state_now is set, the existing pixel-distance α is
+    # multiplied by α_gripper = sigmoid((threshold - gripper_state_now) /
+    # arbitration_gripper_tau). gripper_state_now ∈ [0, 1] (0 = open, 1 = closed).
+    # When gripper closed (carrying object), α_gripper → 0, MPC arrow-pull goes off,
+    # let the VLA do placement naturally. When open (approaching), α_gripper → 1,
+    # full pixel-α applies.
+    # 0 = disabled (legacy: ignore gripper state).
+    arbitration_gripper_threshold: float = 0.0
+    arbitration_gripper_tau: float = 0.05
 
 
 @dataclasses.dataclass
@@ -315,6 +325,14 @@ def compute_arbitration_alpha(spec: GuidanceSpec, weights: MPCWeights,
     to the closer of the arrow's two endpoints. alpha→0 near a critical
     contact point (arrow pickup or drop), alpha→1 elsewhere.
 
+    If `weights.arbitration_gripper_threshold > 0` AND `spec.gripper_state_now`
+    is set, the pixel-distance alpha is further multiplied by
+        alpha_gripper = sigmoid((threshold - gripper_state_now) / gripper_tau)
+    so when the gripper is closed (state ≈ 1), alpha_gripper → 0 and MPC's
+    arrow-pull is gated off (let VLA handle the carry/placement phase).
+    When the gripper is open (state ≈ 0), alpha_gripper → 1 and pixel-alpha
+    applies unchanged.
+
     Returns 1.0 (no arbitration) when arbitration_d_grasp_px <= 0 or the
     arrow is degenerate. Cheap: one EE projection + two norms per cost call.
     """
@@ -334,6 +352,16 @@ def compute_arbitration_alpha(spec: GuidanceSpec, weights: MPCWeights,
     d_min = torch.minimum(d_start, d_end)
     tau = max(float(weights.arbitration_tau_px), 1e-3)
     alpha = torch.sigmoid((d_min - d_crit) / tau)
+
+    # Gripper-state-aware multiplier
+    g_thresh = float(weights.arbitration_gripper_threshold)
+    g_state = spec.gripper_state_now
+    if g_thresh > 0.0 and g_state is not None:
+        g_tau = max(float(weights.arbitration_gripper_tau), 1e-3)
+        # alpha_g near 1 when state < threshold (open), near 0 when state > threshold (closed)
+        alpha_g = torch.sigmoid(torch.tensor((g_thresh - float(g_state)) / g_tau,
+                                              device=device, dtype=dtype))
+        alpha = alpha * alpha_g
     return float(alpha.item())
 
 

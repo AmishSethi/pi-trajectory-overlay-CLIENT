@@ -60,6 +60,13 @@ class GuidanceSpec:
     # having any way to intervene -- the reward term above only helps when CEM
     # is also varying the gripper, which is gated off by freeze_gripper=True.
     gripper_force_override: bool = False
+    # Current gripper position scalar in [0, 1] (0 = open, 1 = closed). Used by
+    # gripper-state-aware arbitration: when the gripper is closed (carrying an
+    # object), the MPC arrow target is for the *next* phase (placement) which
+    # the VLA is better at — so MPC's arrow-pull is gated off via α_gripper
+    # multiplied into the existing pixel-distance arbitration α.
+    # None = old behaviour (no gripper-state arbitration).
+    gripper_state_now: Optional[float] = None
 
 
 # --------------------------------------------------------------------------- #

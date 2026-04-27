@@ -155,6 +155,10 @@ class Args:
     mpc_arbitration_d_grasp_px: float = 0.0
     mpc_arbitration_tau_px: float = 15.0
     mpc_prior_boost_near_waypoint: float = 0.0
+    # Gripper-state-aware arbitration: > 0 enables α_gripper that goes to 0
+    # when gripper closed (state > threshold). 0 = disabled.
+    mpc_arbitration_gripper_threshold: float = 0.0
+    mpc_arbitration_gripper_tau: float = 0.05
     # --- Trust-region projection on CEM samples ---------------------------
     # When > 0, every CEM sample is projected into an L2 ball of this
     # radius around the VLA prior. Hard cap on how far the refined chunk
@@ -353,6 +357,8 @@ def _make_mpc_runtime(args: "Args"):
         arbitration_d_grasp_px=float(args.mpc_arbitration_d_grasp_px),
         arbitration_tau_px=float(args.mpc_arbitration_tau_px),
         prior_boost_near_waypoint=float(args.mpc_prior_boost_near_waypoint),
+        arbitration_gripper_threshold=float(args.mpc_arbitration_gripper_threshold),
+        arbitration_gripper_tau=float(args.mpc_arbitration_gripper_tau),
     )
     cem_params = CEMParams(
         n_samples=int(args.mpc_n_samples),
@@ -388,6 +394,7 @@ def _refine_chunk_with_mpc(
     gripper_reward_weight: float = 0.0,
     gripper_zone_frac: float = 0.15,
     gripper_force_override: bool = False,
+    gripper_state_now: float | None = None,
 ) -> np.ndarray:
     """Run client-side CEM over the server's chunk. Returns (T, 8) numpy."""
     import torch  # local import: torch only needed in mpc path
@@ -400,6 +407,7 @@ def _refine_chunk_with_mpc(
         gripper_reward_weight=gripper_reward_weight,
         gripper_zone_frac=gripper_zone_frac,
         gripper_force_override=gripper_force_override,
+        gripper_state_now=gripper_state_now,
     )
     # .copy() — server responses arrive as read-only numpy views from msgpack;
     # torch.as_tensor on a non-writable array triggers a UserWarning.
@@ -655,6 +663,7 @@ def main(args: Args):
                             gripper_reward_weight=args.mpc_gripper_reward_weight,
                             gripper_zone_frac=args.mpc_gripper_zone_frac,
                             gripper_force_override=args.mpc_gripper_force_override,
+                            gripper_state_now=float(np.asarray(curr_obs["gripper_position"]).flatten()[0]),
                         )
                         inference_ms += (time.time() - _mpc_start) * 1000
 
@@ -853,6 +862,16 @@ if __name__ == "__main__":
         "--mpc-trust-region-radius", "--mpc_trust_region_radius", type=float, default=0.0,
         help="Hard L2 cap on how far a CEM sample may deviate from a_vla. 0 = off.",
     )
+    parser.add_argument(
+        "--mpc-arbitration-gripper-threshold", "--mpc_arbitration_gripper_threshold",
+        type=float, default=0.0,
+        help="When > 0, multiplies arbitration alpha by sigmoid((threshold - gripper_state_now)/gripper_tau). When gripper closed, MPC arrow-pull is gated off (let VLA do placement). 0 = off.",
+    )
+    parser.add_argument(
+        "--mpc-arbitration-gripper-tau", "--mpc_arbitration_gripper_tau",
+        type=float, default=0.05,
+        help="Sigmoid sharpness for the gripper-state arbitration. Smaller = sharper transition.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     ns, _ = parser.parse_known_args()
     ns.enable_cameras = True
@@ -897,6 +916,8 @@ if __name__ == "__main__":
             mpc_arbitration_tau_px=ns.mpc_arbitration_tau_px,
             mpc_prior_boost_near_waypoint=ns.mpc_prior_boost_near_waypoint,
             mpc_trust_region_radius=ns.mpc_trust_region_radius,
+            mpc_arbitration_gripper_threshold=ns.mpc_arbitration_gripper_threshold,
+            mpc_arbitration_gripper_tau=ns.mpc_arbitration_gripper_tau,
         ))
     finally:
         _SIM_APP.close()
