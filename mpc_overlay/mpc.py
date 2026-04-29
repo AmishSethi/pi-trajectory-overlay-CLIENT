@@ -544,20 +544,37 @@ def mpc_overlay(
     # `gripper_zone_frac` of the arrow start, force full close; near the end,
     # force full open.
     if getattr(spec_d, "gripper_force_override", False) and spec_d.waypoints_px.shape[0] >= 2:
+        # Pixel-distance variant (v6): trigger gripper close when EE projects
+        # within `gripper_force_pixel_zone` of arrow START, open when within
+        # zone of arrow END. More robust than arc-length variant for irregular
+        # arrows. Falls back to arc-length when pixel zone is 0 (legacy).
         from mpc_overlay.trajectory_cost import (
             _cumulative_arc_length, _project_ee_to_arc, ee_pixel_at_q0,
         )
-        cum_arc, total = _cumulative_arc_length(spec_d.waypoints_px.detach())
-        if float(total) > 0.0:
-            ee_now = ee_pixel_at_q0(spec_d, device=device, dtype=a_vla.dtype)
-            s0 = _project_ee_to_arc(ee_now, spec_d.waypoints_px.detach(), cum_arc, total)
-            frac = float((s0 / total.clamp(min=1e-12)).item())
-            zone = float(spec_d.gripper_zone_frac)
+        ee_now = ee_pixel_at_q0(spec_d, device=device, dtype=a_vla.dtype)
+        wp = spec_d.waypoints_px.detach().to(device=device, dtype=a_vla.dtype)
+        d_start = float(torch.linalg.vector_norm(ee_now - wp[0]).item())
+        d_end = float(torch.linalg.vector_norm(ee_now - wp[-1]).item())
+        pixel_zone = float(getattr(spec_d, "gripper_force_pixel_zone", 0.0) or 0.0)
+        if pixel_zone > 0.0:
             if best.shape[-1] >= 8:
-                if frac < zone:
+                if d_start < pixel_zone:
                     best = best.clone()
                     best[:, 7] = 1.0
-                elif frac > 1.0 - zone:
+                elif d_end < pixel_zone:
                     best = best.clone()
                     best[:, 7] = -1.0
+        else:
+            cum_arc, total = _cumulative_arc_length(spec_d.waypoints_px.detach())
+            if float(total) > 0.0:
+                s0 = _project_ee_to_arc(ee_now, spec_d.waypoints_px.detach(), cum_arc, total)
+                frac = float((s0 / total.clamp(min=1e-12)).item())
+                zone = float(spec_d.gripper_zone_frac)
+                if best.shape[-1] >= 8:
+                    if frac < zone:
+                        best = best.clone()
+                        best[:, 7] = 1.0
+                    elif frac > 1.0 - zone:
+                        best = best.clone()
+                        best[:, 7] = -1.0
     return best

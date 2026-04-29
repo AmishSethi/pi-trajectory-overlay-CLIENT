@@ -67,6 +67,12 @@ class GuidanceSpec:
     # multiplied into the existing pixel-distance arbitration α.
     # None = old behaviour (no gripper-state arbitration).
     gripper_state_now: Optional[float] = None
+    # Pixel zone for force-override (v6 addition): when > 0 AND
+    # gripper_force_override=True, gripper close is forced when EE pixel is
+    # within this many pixels of arrow START, open when within zone of END.
+    # Replaces the legacy arc-length-based force override (which is used when
+    # this is 0). Pixel-based is more robust for non-uniform arrows.
+    gripper_force_pixel_zone: float = 0.0
 
 
 # --------------------------------------------------------------------------- #

@@ -139,6 +139,7 @@ class Args:
     # the grasp-stall mode where VLA closes gripper one step and releases the
     # next. Independent of the reward term -- works with freeze_gripper=True.
     mpc_gripper_force_override: bool = False
+    mpc_gripper_force_pixel_zone: float = 0.0
     # Progress reward (MPCC-style): rewards the chunk's ending EE arc-length
     # projection being further along the arrow than its starting projection.
     # 0.0 = disabled. Useful for "pure arrow follower" extreme-mode testing.
@@ -395,6 +396,7 @@ def _refine_chunk_with_mpc(
     gripper_zone_frac: float = 0.15,
     gripper_force_override: bool = False,
     gripper_state_now: float | None = None,
+    gripper_force_pixel_zone: float = 0.0,
 ) -> np.ndarray:
     """Run client-side CEM over the server's chunk. Returns (T, 8) numpy."""
     import torch  # local import: torch only needed in mpc path
@@ -408,6 +410,7 @@ def _refine_chunk_with_mpc(
         gripper_zone_frac=gripper_zone_frac,
         gripper_force_override=gripper_force_override,
         gripper_state_now=gripper_state_now,
+        gripper_force_pixel_zone=gripper_force_pixel_zone,
     )
     # .copy() — server responses arrive as read-only numpy views from msgpack;
     # torch.as_tensor on a non-writable array triggers a UserWarning.
@@ -664,6 +667,7 @@ def main(args: Args):
                             gripper_zone_frac=args.mpc_gripper_zone_frac,
                             gripper_force_override=args.mpc_gripper_force_override,
                             gripper_state_now=float(np.asarray(curr_obs["gripper_position"]).flatten()[0]),
+                            gripper_force_pixel_zone=args.mpc_gripper_force_pixel_zone,
                         )
                         inference_ms += (time.time() - _mpc_start) * 1000
 
@@ -835,6 +839,10 @@ if __name__ == "__main__":
         help="Arc-length fraction at each end of the arrow defining the gripper-reward zones (default 0.15 = first/last 15%).",
     )
     parser.add_argument(
+        "--mpc-gripper-force-pixel-zone", "--mpc_gripper_force_pixel_zone", type=float, default=0.0,
+        help="When > 0 AND --mpc-gripper-force-override is set, force gripper close when EE pixel is within this many pixels of arrow START, open when within zone of END. Replaces legacy arc-length-based override.",
+    )
+    parser.add_argument(
         "--mpc-gripper-force-override", "--mpc_gripper_force_override", action="store_true", default=False,
         help="Post-CEM hard override: force gripper closed when EE is near arrow start, open near end. Addresses grasp-stall failure mode.",
     )
@@ -910,6 +918,7 @@ if __name__ == "__main__":
             mpc_gripper_reward_weight=ns.mpc_gripper_reward_weight,
             mpc_gripper_zone_frac=ns.mpc_gripper_zone_frac,
             mpc_gripper_force_override=ns.mpc_gripper_force_override,
+            mpc_gripper_force_pixel_zone=ns.mpc_gripper_force_pixel_zone,
             mpc_lam_prog=ns.mpc_lam_prog,
             mpc_freeze_gripper=(not ns.mpc_unfreeze_gripper),
             mpc_arbitration_d_grasp_px=ns.mpc_arbitration_d_grasp_px,
