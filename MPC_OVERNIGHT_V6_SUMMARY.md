@@ -83,3 +83,23 @@ Closing this gap requires a finetuned VLA, not better MPC tuning.
 - `tmp/overnight_v5/runs/phaseA..D_*/` — 96 task × variant rollouts
 - `tmp/overnight_v6/runs/phaseA2_*/` — 4 additional baseline rollouts (all fail)
 - `rollouts/2026_04_28_mpc_sweep_v5/winning_runs/` — v5 wins with rollout.mp4
+
+## Update (post-commit): v_smart_grip validation
+
+Tested v_smart_grip (the new pixel-distance grip-trigger from commit
+`52a4ecc`) on the 7 wins + 5 borderline tasks. Result:
+
+- v_smart_grip rescues a SUBSET of v_arb_lam10_grip's wins (apple_yogurt,
+  canned_food, onebottleinsquarepail, toyinbin, unstackrubikscube)
+- LOST bananasinbinthreetotal (500 step fail vs lam10_grip's 414 win)
+- LOST bowlinbin (500 step fail vs lam10_grip's 399 win)
+- All shared wins are SLOWER (e.g. canned_food 336 vs lam10_grip 114, 3×
+  slower)
+- 0 new rescues on borderline tasks (markerinmug, throwapple, bagelsonplate)
+
+Conclusion: pixel-distance force-override is a regression vs the
+existing arbitration + grip-aware combination. Don't ship it on by
+default. Useful only as an opt-in tuning knob.
+
+The recommendation stays as v_arb_lam10_grip / v_arb_lam3 per task,
+without force-override.
