@@ -82,6 +82,17 @@ class Args:
     open_loop_horizon: int = 8
     num_envs: int = 1
 
+    # Action space the server emits.
+    #   "jointvel" — normalised joint-velocity output (e.g. checkpoint
+    #     `pi05_droid` from gs://openpi-assets). Each step is integrated
+    #     into a position target via DROID_VEL_LIMITS / 15 Hz. This is the
+    #     legacy default and matches RoboLab's `Pi0DroidJointvelClient`.
+    #   "jointpos" — joint-position output (e.g. checkpoint
+    #     `pi05_droid_jointpos` from gs://openpi-assets-simeval, used in the
+    #     RoboLab benchmark). Each step is consumed directly as a 7-DoF
+    #     position target. Matches RoboLab's `Pi0DroidJointposClient`.
+    action_space: str = "jointvel"
+
     # Policy server
     remote_host: str = "0.0.0.0"
     remote_port: int = 8000
@@ -126,6 +137,26 @@ class Args:
     # LLM calls take ~10-15 s each, so small values will stall the rollout.
     # Irrelevant when --canned-waypoints-json is set.
     plan_freq: int = 100
+
+    # Multi-step planning (eva_pal_share trajectory_v1 pattern, 2026-05-04).
+    # When True: instruction is decomposed into a list of steps; each step
+    # gets its OWN trajectory; periodic Gemini step-completion checks advance
+    # the state machine to the next step. Fixes failure modes where a single
+    # arrow over the whole task can't cover multi-pickup scenes (e.g.
+    # `BananasInCrateTask` — the v_arb_lam3 regression).
+    enable_multistep: bool = False
+    # Run a Gemini "is current step complete?" check every N env steps.
+    # Each check is one Gemini call (~5-10s) + up to 3 frames; keep large.
+    multistep_check_interval: int = 30
+
+    # When True, paint the LLM-planned trajectory (mpc_waypoints) onto the
+    # external camera image *before* sending to the policy server, using the
+    # same training-time TraceOverlayConfig as `main_robolab_overlay.py`.
+    # Required when serving the trajectory_overlay finetune
+    # (`brandonyang/pi05_droid_trajectory_overlay`) — that model was
+    # trained to follow a drawn arrow, so the input image must contain one.
+    # No-op when --guidance-mode=off or when waypoints aren't available.
+    draw_trajectory_overlay: bool = False
 
     # Sliding-window arrow target (v2). None = legacy full-arrow target. Set to
     # e.g. 0.15 to ask MPC to advance 15% of the arrow's arc length per chunk.
@@ -341,6 +372,85 @@ def _plan_waypoints_via_subprocess(
         return wp
 
 
+# --- Multi-step planner subprocess (eva_pal_share trajectory_v1.py pattern) ---
+# Usage: see google-gen-ai-env/multistep_planner.py. Three modes:
+#   - decompose: instruction + frame -> step list
+#   - plan_step: frame + step dict -> trajectory waypoints (replanned per step)
+#   - check_completion: frames + step text -> is_complete bool
+# Adds GPT/Gemini subprocess overhead per call (~10-20s) so use sparingly.
+_MULTISTEP_SCRIPT = os.path.join(_LLM_PLANNER_DIR, "multistep_planner.py")
+
+
+def _multistep_subprocess(mode: str, *, timeout: float = 60.0, **kwargs) -> dict | None:
+    """Generic subprocess wrapper for multistep_planner.py.
+    Returns the result dict (with `ok` key) or None on subprocess-level failure."""
+    import subprocess
+    import tempfile
+
+    if not os.path.exists(_LLM_PLANNER_PY):
+        print(f"[multistep] planner venv missing at {_LLM_PLANNER_PY}; skipping")
+        return None
+    if not os.path.exists(_MULTISTEP_SCRIPT):
+        print(f"[multistep] multistep_planner.py not found at {_MULTISTEP_SCRIPT}; skipping")
+        return None
+
+    with tempfile.TemporaryDirectory(prefix=f"ms_{mode}_") as tmpd:
+        out_path = os.path.join(tmpd, "out.json")
+        cmd = [_LLM_PLANNER_PY, _MULTISTEP_SCRIPT,
+               "--mode", mode, "--output-json", out_path]
+
+        # Mode-specific args.
+        if mode == "decompose":
+            img = kwargs["pil_image"]
+            img_path = os.path.join(tmpd, "frame.png")
+            img.save(img_path)
+            cmd += ["--image-path", img_path,
+                    "--instruction", kwargs["instruction"],
+                    "--gpt-model", kwargs.get("gpt_model", "gpt-4o-mini")]
+        elif mode == "plan_step":
+            img = kwargs["pil_image"]
+            img_path = os.path.join(tmpd, "frame.png")
+            img.save(img_path)
+            cmd += ["--image-path", img_path,
+                    "--step-json", json.dumps(kwargs["step"]),
+                    "--instruction", kwargs.get("instruction", ""),
+                    "--gpt-model", kwargs.get("gpt_model", "gpt-4o-mini"),
+                    "--gemini-model", kwargs.get("gemini_model", "gemini-robotics-er-1.6-preview")]
+        elif mode == "check_completion":
+            paths = []
+            for i, im in enumerate(kwargs["pil_images"]):
+                p = os.path.join(tmpd, f"f{i:03d}.png")
+                im.save(p)
+                paths.append(p)
+            cmd += ["--image-paths", *paths,
+                    "--step-text", kwargs["step_text"],
+                    "--gemini-model", kwargs.get("gemini_model", "gemini-robotics-er-1.6-preview")]
+        else:
+            print(f"[multistep] unknown mode: {mode}")
+            return None
+
+        try:
+            result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            print(f"[multistep/{mode}] subprocess timed out after {timeout}s")
+            return None
+        if result.returncode != 0 or not os.path.exists(out_path):
+            print(f"[multistep/{mode}] subprocess failed (rc={result.returncode})")
+            if result.stderr:
+                print(result.stderr[-500:])
+            return None
+        try:
+            with open(out_path) as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[multistep/{mode}] could not parse output: {e!r}")
+            return None
+        if not data.get("ok", False):
+            print(f"[multistep/{mode}] error: {data.get('error', 'unknown')}")
+            return None
+        return data
+
+
 def _make_mpc_runtime(args: "Args"):
     """Build the (weights, cem_params) pair once per rollout; reused every step.
 
@@ -397,26 +507,78 @@ def _refine_chunk_with_mpc(
     gripper_force_override: bool = False,
     gripper_state_now: float | None = None,
     gripper_force_pixel_zone: float = 0.0,
+    action_space: str = "jointvel",
 ) -> np.ndarray:
-    """Run client-side CEM over the server's chunk. Returns (T, 8) numpy."""
+    """Run client-side CEM over the server's chunk. Returns (T, 8) numpy.
+
+    For ``action_space == "jointpos"`` (e.g. pi05_droid_jointpos): the server's
+    chunk is in joint-position space. We delta-encode it into a "fake velocity"
+    chunk where each step's first 7 dims are absolute position deltas in
+    radians, and run the MPC with ``joint_vel_scale=ones(7), control_dt=1.0``
+    so the existing ``q_traj = q0 + cumsum(a*jvs*dt)`` integration yields the
+    same positions back. After MPC, we re-encode the optimized chunk to
+    absolute positions (cumulative sum starting from q0). This keeps every
+    line of mpc_overlay/ unchanged.
+    """
     import torch  # local import: torch only needed in mpc path
     from mpc_overlay import mpc_overlay
     from simulator.mpc_sim_adapter import build_sim_guidance_spec
 
-    spec = build_sim_guidance_spec(
-        env, waypoints_px=waypoints_px, q0_7=q0_7, env_id=env_id,
-        arrow_lookahead=arrow_lookahead,
-        gripper_reward_weight=gripper_reward_weight,
-        gripper_zone_frac=gripper_zone_frac,
-        gripper_force_override=gripper_force_override,
-        gripper_state_now=gripper_state_now,
-        gripper_force_pixel_zone=gripper_force_pixel_zone,
-    )
-    # .copy() — server responses arrive as read-only numpy views from msgpack;
-    # torch.as_tensor on a non-writable array triggers a UserWarning.
-    a_vla = torch.as_tensor(np.asarray(pred_action_chunk).copy(), dtype=torch.float32, device=device)
-    a_opt = mpc_overlay(a_vla, spec, weights, cem_params)  # spec tensors are auto-moved by mpc_overlay
-    return a_opt.detach().cpu().numpy().astype(pred_action_chunk.dtype)
+    if action_space == "jointpos":
+        # Convert position chunk -> normalised "velocity" chunk so MPC's
+        # standard machinery (which integrates a*jvs*dt) reconstructs the
+        # original positions. Using DROID_VEL_LIMITS/15 Hz keeps CEM's
+        # init_std=0.05 producing the *same* per-step position drift as
+        # jointvel mode (~0.007 rad/step), which prevents CEM from
+        # blowing past the VLA prior. Action-box must be disabled (lam_c=0)
+        # because the model's first chunk step can be a large absolute jump
+        # from current pose (e.g. ~2 rad) which exceeds [-1, 1] norm.
+        pos = np.asarray(pred_action_chunk[..., :7], dtype=np.float32)
+        q0 = np.asarray(q0_7, dtype=np.float32)
+        deltas = np.empty_like(pos)
+        deltas[0] = pos[0] - q0
+        deltas[1:] = pos[1:] - pos[:-1]
+        # Convert deltas to normalised velocities: v_norm = delta / (jvs * dt)
+        jvs_arr = DROID_VEL_LIMITS.astype(np.float32)
+        dt = 1.0 / float(SIM_CONTROL_FREQUENCY)
+        v_norm = deltas / (jvs_arr * dt)[None, :]
+        a_vla_np = np.concatenate([v_norm, np.asarray(pred_action_chunk[..., 7:8])], axis=-1)
+        spec = build_sim_guidance_spec(
+            env, waypoints_px=waypoints_px, q0_7=q0_7, env_id=env_id,
+            arrow_lookahead=arrow_lookahead,
+            gripper_reward_weight=gripper_reward_weight,
+            gripper_zone_frac=gripper_zone_frac,
+            gripper_force_override=gripper_force_override,
+            gripper_state_now=gripper_state_now,
+            gripper_force_pixel_zone=gripper_force_pixel_zone,
+        )
+    else:
+        a_vla_np = np.asarray(pred_action_chunk).copy()
+        spec = build_sim_guidance_spec(
+            env, waypoints_px=waypoints_px, q0_7=q0_7, env_id=env_id,
+            arrow_lookahead=arrow_lookahead,
+            gripper_reward_weight=gripper_reward_weight,
+            gripper_zone_frac=gripper_zone_frac,
+            gripper_force_override=gripper_force_override,
+            gripper_state_now=gripper_state_now,
+            gripper_force_pixel_zone=gripper_force_pixel_zone,
+        )
+
+    a_vla = torch.as_tensor(a_vla_np.copy(), dtype=torch.float32, device=device)
+    a_opt = mpc_overlay(a_vla, spec, weights, cem_params)
+    a_opt_np = a_opt.detach().cpu().numpy().astype(pred_action_chunk.dtype)
+
+    if action_space == "jointpos":
+        # Re-encode normalised velocities -> absolute positions:
+        # pos_opt[k] = q0 + sum_{j<=k} v_norm_opt[j] * jvs * dt
+        v_norm_opt = a_opt_np[..., :7]
+        jvs_arr = DROID_VEL_LIMITS.astype(pred_action_chunk.dtype)
+        dt = 1.0 / float(SIM_CONTROL_FREQUENCY)
+        deltas_opt = v_norm_opt * (jvs_arr * dt)[None, :]
+        pos_opt = np.cumsum(deltas_opt, axis=0) + np.asarray(q0_7, dtype=pred_action_chunk.dtype)[None, :]
+        a_opt_np = np.concatenate([pos_opt, a_opt_np[..., 7:8]], axis=-1)
+
+    return a_opt_np
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +674,15 @@ def main(args: Args):
             mpc_device = _resolve_mpc_device(args.mpc_device)
             print(f"[mpc] device={mpc_device}")
 
+        # Multi-step planner state (eva_pal_share trajectory_v1 pattern).
+        # Populated lazily on first planning trigger when --enable-multistep is set.
+        ms_steps: list[dict] | None = None     # full decomposed step list
+        ms_step_idx: int = 0                   # which step we're currently on
+        ms_step_completed: bool = False        # set True once we've advanced past the last step
+        ms_completion_buffer: list = []        # PIL images since the last completion check, capped
+        ms_last_check_t: int = -10**9          # t_step at which we last ran a completion check
+        MS_BUFFER_CAP = 8                      # at most this many recent frames go to Gemini
+
         # RoboLab examples reset twice before a rollout to let physics settle.
         obs, _ = env.reset()
         obs, _ = env.reset()
@@ -534,7 +705,18 @@ def main(args: Args):
                 mpc_waypoints = None
 
         auto_success = None  # set from env term/trunc if the episode ends early
-        bar = tqdm.tqdm(range(args.max_timesteps), desc="Running rollout")
+        # Use the env's own max_episode_length if it is *larger* than the
+        # CLI default — RoboLab tasks can range from 20s to 600s
+        # (300–9000 steps at 15 Hz). The CLI default of 600 was set before we
+        # discovered the per-task lengths.
+        try:
+            env_max = int(env.max_episode_length)
+        except Exception:
+            env_max = args.max_timesteps
+        rollout_steps = max(args.max_timesteps, env_max)
+        if rollout_steps != args.max_timesteps:
+            print(f"[main_robolab] Using env.max_episode_length={env_max} (overrides --max-timesteps={args.max_timesteps})")
+        bar = tqdm.tqdm(range(rollout_steps), desc="Running rollout")
         print("Press Ctrl+C to stop early.")
         if args.save_frames:
             print(f"Per-step frames → {frames_dir}")
@@ -548,12 +730,129 @@ def main(args: Args):
                 wrist_image = curr_obs["wrist_image"]
                 video_frames.append(ext_image)
 
-                # --- LLM re-planning (subprocess) ----------------------------
-                # Fire plan_waypoints.py the first time we enter the loop in
-                # MPC mode (if not using canned waypoints) and then every
-                # plan_freq env steps thereafter. Waypoints are used by the MPC
-                # refinement block below the policy_client.infer call.
+                # --- Multi-step planning (eva_pal_share trajectory_v1) ------
+                # When --enable-multistep is on:
+                #   1. On first plan, decompose instruction into ms_steps.
+                #   2. Plan trajectory for the CURRENT step only.
+                #   3. Periodically (every multistep_check_interval frames),
+                #      ask Gemini "is the current step done?" If yes, advance
+                #      ms_step_idx and replan for the new step.
+                # Falls back to single-arrow plan_waypoints flow when disabled.
                 if (
+                    args.guidance_mode == "mpc"
+                    and not using_canned_waypoints
+                    and args.enable_multistep
+                ):
+                    # 1. First time: decompose instruction.
+                    if ms_steps is None and not ms_step_completed:
+                        _pil_frame = Image.fromarray(ext_image).convert("RGB")
+                        _t0 = time.time()
+                        _decomp = _multistep_subprocess(
+                            "decompose",
+                            pil_image=_pil_frame,
+                            instruction=instruction,
+                            gpt_model=args.gpt_model,
+                        )
+                        if _decomp is not None and _decomp.get("steps"):
+                            ms_steps = _decomp["steps"]
+                            ms_step_idx = 0
+                            print(f"[multistep] t={t_step} decomposed into {len(ms_steps)} step(s) "
+                                  f"in {time.time()-_t0:.1f}s")
+                            for _i, _s in enumerate(ms_steps):
+                                print(f"  step {_i}: {_s.get('step', '?')!r}  "
+                                      f"manip={_s.get('manipulating_object', '?')}  "
+                                      f"target={_s.get('target_location', '?')}")
+                            with open(os.path.join(run_dir, "decomposition.json"), "w") as f:
+                                json.dump(_decomp, f, indent=2)
+                        else:
+                            print(f"[multistep] t={t_step} decompose FAILED, falling back to single-step")
+                            ms_steps = [{
+                                "step": instruction,
+                                "manipulating_object": "object",
+                                "target_related_object": "",
+                                "target_location": "",
+                            }]
+                            ms_step_idx = 0
+
+                    # 2. Periodic step-completion check.
+                    if (ms_steps is not None
+                            and not ms_step_completed
+                            and ms_step_idx < len(ms_steps)
+                            and t_step - ms_last_check_t >= args.multistep_check_interval
+                            and len(ms_completion_buffer) > 0):
+                        ms_last_check_t = t_step
+                        cur_step = ms_steps[ms_step_idx]
+                        cur_text = cur_step.get("step", instruction)
+                        # send up to MS_BUFFER_CAP recent frames
+                        _frames_for_check = ms_completion_buffer[-MS_BUFFER_CAP:]
+                        _t0 = time.time()
+                        _comp = _multistep_subprocess(
+                            "check_completion",
+                            pil_images=_frames_for_check,
+                            step_text=cur_text,
+                            gemini_model=args.gemini_model,
+                        )
+                        if _comp is not None and _comp.get("is_complete"):
+                            print(f"[multistep] t={t_step} step {ms_step_idx} COMPLETE "
+                                  f"({cur_text!r}) reasoning={_comp.get('reasoning', '?')[:80]}")
+                            ms_step_idx += 1
+                            ms_completion_buffer = []
+                            mpc_waypoints = None  # force replan for next step
+                            if ms_step_idx >= len(ms_steps):
+                                ms_step_completed = True
+                                print(f"[multistep] all {len(ms_steps)} step(s) complete at t={t_step}")
+                        else:
+                            print(f"[multistep] t={t_step} step {ms_step_idx} not yet complete "
+                                  f"(checked {len(_frames_for_check)} frames in {time.time()-_t0:.1f}s)")
+
+                    # Append current frame to buffer for next check.
+                    if ms_steps is not None and not ms_step_completed:
+                        ms_completion_buffer.append(Image.fromarray(ext_image).convert("RGB"))
+                        if len(ms_completion_buffer) > MS_BUFFER_CAP * 2:
+                            ms_completion_buffer = ms_completion_buffer[-MS_BUFFER_CAP:]
+
+                    # 3. Plan trajectory for the CURRENT step. Triggered by:
+                    #   - mpc_waypoints is None (just advanced step OR first plan), OR
+                    #   - plan_freq elapsed since last plan (re-localize stale step).
+                    if (ms_steps is not None
+                            and not ms_step_completed
+                            and ms_step_idx < len(ms_steps)
+                            and (mpc_waypoints is None
+                                 or (args.plan_freq > 0 and t_step > 0
+                                     and t_step % args.plan_freq == 0))):
+                        _pil_frame = Image.fromarray(ext_image).convert("RGB")
+                        cur_step = ms_steps[ms_step_idx]
+                        _t0 = time.time()
+                        _ps = _multistep_subprocess(
+                            "plan_step",
+                            pil_image=_pil_frame,
+                            step=cur_step,
+                            instruction=instruction,
+                            gpt_model=args.gpt_model,
+                            gemini_model=args.gemini_model,
+                        )
+                        _wall = time.time() - _t0
+                        if _ps is not None and _ps.get("waypoints_px"):
+                            mpc_waypoints = np.asarray(_ps["waypoints_px"], dtype=np.float32)
+                            plan_count += 1
+                            np.save(os.path.join(run_dir, f"mpc_waypoints_{plan_count:03d}.npy"), mpc_waypoints)
+                            with open(os.path.join(run_dir, f"mpc_waypoints_{plan_count:03d}.json"), "w") as f:
+                                json.dump({
+                                    "waypoints_px": mpc_waypoints.tolist(),
+                                    "t_step": t_step,
+                                    "step_index": ms_step_idx,
+                                    "step": cur_step,
+                                    "planning_wall_seconds": round(_wall, 2),
+                                    "source": "multistep_planner",
+                                }, f)
+                            print(f"[multistep/plan] t={t_step} step={ms_step_idx} "
+                                  f"plan_count={plan_count} wall={_wall:.1f}s "
+                                  f"({len(mpc_waypoints)} waypoints)")
+                        else:
+                            print(f"[multistep/plan] t={t_step} step={ms_step_idx} FAILED")
+
+                # --- Legacy single-arrow LLM re-planning (multistep disabled) -
+                elif (
                     args.guidance_mode == "mpc"
                     and not using_canned_waypoints
                     and (
@@ -585,10 +884,33 @@ def main(args: Args):
                     else:
                         print(f"[mpc/plan] t={t_step} planner failed; keeping previous waypoints (have={mpc_waypoints is not None})")
 
+                # Optionally draw the LLM-planned trajectory onto the
+                # external image before sending to the policy server. The
+                # `pi05_droid_trajectory_overlay` finetune was trained to
+                # follow a drawn arrow, so it needs to see one. When
+                # `--draw-trajectory-overlay` is OFF (default), the raw
+                # camera image is used.
+                ext_for_policy = ext_image
+                if args.draw_trajectory_overlay and mpc_waypoints is not None and len(mpc_waypoints) >= 2:
+                    try:
+                        from traj_vis_utils import TraceOverlayConfig, add_trace_overlay
+                        pts = [tuple(map(float, p)) for p in mpc_waypoints]
+                        result = add_trace_overlay(
+                            ext_image,
+                            pts,
+                            current_index=0,
+                            config=TraceOverlayConfig(),
+                            num_interpolated=100,
+                        )
+                        ext_for_policy = np.array(result.convert("RGB"))
+                    except Exception as _e:
+                        if t_step == 0:
+                            print(f"[overlay-draw] failed: {_e!r} — falling back to raw frame")
+
                 # Compute 224x224 model inputs up front so we can dump them to
                 # disk every step even if we don't query the policy this step.
                 # These are the EXACT tensors sent to the policy server.
-                model_input_ext = image_tools.resize_with_pad(ext_image, 224, 224)
+                model_input_ext = image_tools.resize_with_pad(ext_for_policy, 224, 224)
                 model_input_wrist = image_tools.resize_with_pad(wrist_image, 224, 224)
 
                 # --- Optionally save every frame to disk, incrementally ---
@@ -668,6 +990,7 @@ def main(args: Args):
                             gripper_force_override=args.mpc_gripper_force_override,
                             gripper_state_now=float(np.asarray(curr_obs["gripper_position"]).flatten()[0]),
                             gripper_force_pixel_zone=args.mpc_gripper_force_pixel_zone,
+                            action_space=args.action_space,
                         )
                         inference_ms += (time.time() - _mpc_start) * 1000
 
@@ -678,11 +1001,17 @@ def main(args: Args):
                 action = pred_action_chunk[actions_from_chunk_completed]
                 actions_from_chunk_completed += 1
 
-                # Velocity → position integration (sim env expects joint-
-                # position targets; the server emits joint velocities).
-                q_target = _integrate_velocity(action[:7], q_target)
+                if args.action_space == "jointpos":
+                    # Server emits joint *positions* directly (e.g.
+                    # pi05_droid_jointpos checkpoint). Use as-is.
+                    q_target = np.asarray(action[:7], dtype=np.float32)
+                else:
+                    # Velocity → position integration (sim env expects joint-
+                    # position targets; the server emits joint velocities).
+                    q_target = _integrate_velocity(action[:7], q_target)
 
-                # Binarize gripper (same threshold as main_pi05.py)
+                # Binarize gripper (same threshold as main_pi05.py and
+                # both RoboLab Pi0Droid clients).
                 if action[-1].item() > 0.5:
                     gripper = np.ones((1,), dtype=np.float32)
                 else:
@@ -798,6 +1127,13 @@ if __name__ == "__main__":
     parser.add_argument("--fake-policy", "--fake_policy", action="store_true")
     parser.add_argument("--save-dir", "--save_dir", type=str, default="runs_robolab")
     parser.add_argument("--save-frames", "--save_frames", action="store_true")
+    parser.add_argument(
+        "--action-space", "--action_space", type=str, default="jointvel",
+        choices=["jointvel", "jointpos"],
+        help="jointvel (legacy): integrate normalized joint velocities * vel_limits / 15Hz. "
+             "jointpos: server emits joint-position targets directly (matches RoboLab's "
+             "Pi0DroidJointposClient + pi05_droid_jointpos checkpoint).",
+    )
 
     # --- MPC-overlay guidance (off by default → baseline behavior) --------
     parser.add_argument(
@@ -880,6 +1216,20 @@ if __name__ == "__main__":
         type=float, default=0.05,
         help="Sigmoid sharpness for the gripper-state arbitration. Smaller = sharper transition.",
     )
+    # Multi-step planning (eva_pal_share trajectory_v1 pattern).
+    parser.add_argument(
+        "--enable-multistep", "--enable_multistep", action="store_true",
+        help="Decompose instruction into steps; replan trajectory per step using Gemini step-completion checks.",
+    )
+    parser.add_argument(
+        "--multistep-check-interval", "--multistep_check_interval", type=int, default=30,
+        help="Run a step-completion check every N env steps (default 30).",
+    )
+    parser.add_argument(
+        "--draw-trajectory-overlay", "--draw_trajectory_overlay", action="store_true",
+        help="Paint LLM trajectory onto external image before sending to policy "
+             "(needed when serving the trajectory_overlay finetune).",
+    )
     AppLauncher.add_app_launcher_args(parser)
     ns, _ = parser.parse_known_args()
     ns.enable_cameras = True
@@ -900,6 +1250,7 @@ if __name__ == "__main__":
             fake_policy=ns.fake_policy,
             save_dir=ns.save_dir,
             save_frames=ns.save_frames,
+            action_space=ns.action_space,
             guidance_mode=ns.guidance_mode,
             canned_waypoints_json=ns.canned_waypoints_json,
             gpt_model=ns.gpt_model,
@@ -914,6 +1265,9 @@ if __name__ == "__main__":
             mpc_init_std=ns.mpc_init_std,
             mpc_device=ns.mpc_device,
             plan_freq=ns.plan_freq,
+            enable_multistep=ns.enable_multistep,
+            multistep_check_interval=ns.multistep_check_interval,
+            draw_trajectory_overlay=ns.draw_trajectory_overlay,
             mpc_arrow_lookahead=ns.mpc_arrow_lookahead,
             mpc_gripper_reward_weight=ns.mpc_gripper_reward_weight,
             mpc_gripper_zone_frac=ns.mpc_gripper_zone_frac,
